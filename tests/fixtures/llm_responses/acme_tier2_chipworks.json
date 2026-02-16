@@ -1,0 +1,17 @@
+{
+  "parent_company": "ChipWorks",
+  "tier": 2,
+  "suppliers": [
+    {
+      "name": "RareMinerals Ltd",
+      "lat": -33.8688,
+      "lon": 151.2093,
+      "confidence": 0.7,
+      "rationale": "ChipWorks sources rare earth elements from RareMinerals Ltd in Sydney, Australia.",
+      "industry": "Mining",
+      "product_category": "Rare earth elements",
+      "location_description": "Sydney, Australia",
+      "relationship_type": "raw_material"
+    }
+  ]
+}

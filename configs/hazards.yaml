@@ -1,0 +1,20 @@
+# Hazard types and scoring thresholds
+hazards:
+  - name: earthquake
+    weight: 0.25
+    threshold: 0.5
+  - name: flood
+    weight: 0.20
+    threshold: 0.4
+  - name: wildfire
+    weight: 0.15
+    threshold: 0.5
+  - name: cyclone
+    weight: 0.15
+    threshold: 0.5
+  - name: heat_stress
+    weight: 0.10
+    threshold: 0.6
+  - name: drought
+    weight: 0.15
+    threshold: 0.5

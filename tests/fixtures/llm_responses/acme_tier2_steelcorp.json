@@ -1,0 +1,17 @@
+{
+  "parent_company": "SteelCorp",
+  "tier": 2,
+  "suppliers": [
+    {
+      "name": "IronOre Global",
+      "lat": -23.5505,
+      "lon": -46.6333,
+      "confidence": 0.75,
+      "rationale": "SteelCorp imports iron ore from IronOre Global, a mining company based in São Paulo, Brazil.",
+      "industry": "Mining",
+      "product_category": "Iron ore",
+      "location_description": "São Paulo, Brazil",
+      "relationship_type": "raw_material"
+    }
+  ]
+}

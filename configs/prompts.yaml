@@ -1,0 +1,78 @@
+# Prompt templates for LLM orchestration
+report_system_prompt: |
+  You are a supply-chain risk analyst. Summarise the hazard findings
+  for the given company and its supplier network. Reference evidence
+  items using [E1], [E2], etc.
+
+company_profile_prompt: |
+  Given the company "{company}", identify:
+  - canonical_name: The full official company name
+  - industry: Primary industry sector (e.g., "Consumer Electronics", "Automotive Manufacturing")
+  - products: 2-5 main product lines or services
+  - headquarters: City, country of corporate headquarters
+  - description: One-sentence company description
+
+  Use public knowledge. If uncertain, note that in the description.
+
+tier_expansion_prompt: |
+  Given the company "{company}" in the {industry} industry (products: {products}),
+  identify plausible tier-{tier} suppliers.
+
+  For each supplier, provide:
+  - name: The company name
+  - lat / lon: Latitude and longitude of their primary facility
+  - location_description: City and country (e.g., "Hsinchu, Taiwan")
+  - confidence: How confident you are (0-1) that this is a real supplier relationship
+  - rationale: Why this company is a plausible supplier, citing public knowledge
+  - industry: The supplier's industry sector
+  - product_category: What they supply to the parent (e.g., "Silicon wafers", "Raw steel")
+  - relationship_type: One of: raw_material, component, service, logistics
+
+  Focus on major, well-known suppliers based on public knowledge.
+  If you are uncertain, reflect that in a lower confidence score.
+  Return between 2 and 6 suppliers.
+
+mitigation_prompt: |
+  You are a supply-chain resilience expert. Given the company "{company}"
+  and the hazard assessment data below, generate concrete mitigation
+  strategies for every supplier-hazard pair rated Medium or High.
+
+  {risk_context}
+
+  For each affected supplier-hazard pair, provide:
+  - supplier_name: Exact supplier name from the data
+  - hazard_type: Exact hazard type from the data
+  - level: The risk level (Medium or High)
+  - actions: 2-3 specific, implementable mitigation steps tailored to
+    the supplier's location and the hazard severity. Reference the actual
+    score data (e.g. "1,072 M4+ earthquakes recorded") when relevant.
+  - priority: P1 (act within 48 hours), P2 (act within 2 weeks),
+    P3 (ongoing monitoring). Assign P1 to High hazards, P2 to Medium.
+  - rationale: A one-sentence explanation citing the specific score and
+    location data that justifies these actions.
+
+  Focus on practical, cost-effective recommendations. Consider the
+  supplier's geographic location when suggesting alternatives.
+  Do NOT generate mitigations for Low-rated hazards.
+
+suggest_alternatives_prompt: |
+  You are a supply-chain diversification specialist. Given the company "{company}"
+  and the hazard assessment data below, suggest alternative suppliers for
+  the highest-risk suppliers to reduce overall supply-chain risk.
+
+  {risk_context}
+
+  For each supplier with a composite risk score >= 0.5 or any critical threshold
+  alert, suggest 2-3 alternative suppliers located in regions with lower exposure
+  to the dominant hazard. For each alternative, provide:
+  - name: A plausible real company name in the same industry
+  - lat / lon: Facility location in a lower-hazard region
+  - confidence: How viable this alternative is as a replacement (0-1)
+  - rationale: Why this location reduces exposure to the specific hazard
+
+  Ground your suggestions in geographic hazard knowledge. For example, avoid the
+  Pacific Ring of Fire for earthquake risk, avoid low-lying river basins for
+  flood risk, and prefer temperate inland regions for cyclone risk.
+
+  Only suggest alternatives for suppliers rated Medium or High risk overall.
+  Do NOT suggest alternatives for Low-risk suppliers.

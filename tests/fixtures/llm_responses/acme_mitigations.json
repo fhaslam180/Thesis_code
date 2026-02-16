@@ -1,0 +1,41 @@
+{
+  "company": "ACME",
+  "mitigations": [
+    {
+      "supplier_name": "ChipWorks",
+      "hazard_type": "earthquake",
+      "level": "High",
+      "actions": [
+        "Activate secondary chip sourcing from a lower-seismicity region within 48 hours.",
+        "Require ChipWorks to submit updated business continuity and facility retrofit plans within 14 days.",
+        "Build a 6-week strategic inventory buffer for high-criticality semiconductor SKUs."
+      ],
+      "priority": "P1",
+      "rationale": "ChipWorks has a high earthquake score and elevated supplier risk, so immediate continuity and buffering actions reduce near-term disruption exposure."
+    },
+    {
+      "supplier_name": "SteelCorp",
+      "hazard_type": "wildfire",
+      "level": "Medium",
+      "actions": [
+        "Require quarterly wildfire readiness drills and fire-break maintenance evidence from SteelCorp sites.",
+        "Shift 20% of near-term steel orders to pre-qualified alternate mills during peak fire season.",
+        "Add two weeks of inbound steel safety stock at ACME's primary assembly hub."
+      ],
+      "priority": "P2",
+      "rationale": "SteelCorp's medium wildfire exposure warrants near-term diversification and inventory controls to absorb seasonal interruption risk."
+    },
+    {
+      "supplier_name": "RareMinerals Ltd",
+      "hazard_type": "cyclone",
+      "level": "High",
+      "actions": [
+        "Pre-book emergency ocean and air freight alternatives for cyclone-season routing disruptions.",
+        "Trigger dual-source qualification for rare mineral feedstock from a non-cyclone basin supplier.",
+        "Require weekly operational status updates from RareMinerals during active cyclone periods."
+      ],
+      "priority": "P1",
+      "rationale": "RareMinerals Ltd faces high cyclone exposure, so ACME needs immediate logistics and sourcing contingencies to avoid extended supply outages."
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "canonical_name": "ACME Corporation",
+  "industry": "Industrial Manufacturing",
+  "products": ["Industrial equipment", "Precision tools", "Safety systems"],
+  "headquarters": "Chicago, USA",
+  "description": "ACME Corporation is a diversified industrial manufacturer specialising in precision equipment and safety systems."
+}

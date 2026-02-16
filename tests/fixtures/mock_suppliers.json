@@ -1,0 +1,38 @@
+{
+  "ACME": {
+    "suppliers": [
+      {
+        "name": "SteelCorp", "lat": 37.7749, "lon": -122.4194, "tier": 1, "confidence": 0.9,
+        "industry": "Steel Manufacturing", "product_category": "Structural steel",
+        "location_description": "San Francisco, USA", "relationship_type": "raw_material"
+      },
+      {
+        "name": "ChipWorks", "lat": 35.6762, "lon": 139.6503, "tier": 1, "confidence": 0.85,
+        "industry": "Semiconductor Manufacturing", "product_category": "Microcontrollers",
+        "location_description": "Tokyo, Japan", "relationship_type": "component"
+      },
+      {
+        "name": "RareMinerals Ltd", "lat": -33.8688, "lon": 151.2093, "tier": 2, "confidence": 0.7,
+        "industry": "Mining", "product_category": "Rare earth elements",
+        "location_description": "Sydney, Australia", "relationship_type": "raw_material"
+      }
+    ],
+    "edges": [
+      {"parent": "ACME", "child": "SteelCorp", "description": "ACME lists SteelCorp as Tier-1 steel supplier"},
+      {"parent": "ACME", "child": "ChipWorks", "description": "ACME lists ChipWorks as Tier-1 chip supplier"},
+      {"parent": "ChipWorks", "child": "RareMinerals Ltd", "description": "ChipWorks sources from RareMinerals Ltd (Tier-2)"}
+    ]
+  },
+  "GlobalMfg": {
+    "suppliers": [
+      {
+        "name": "PlastiCo", "lat": 51.5074, "lon": -0.1278, "tier": 1, "confidence": 0.88,
+        "industry": "Plastics Manufacturing", "product_category": "Injection-moulded parts",
+        "location_description": "London, UK", "relationship_type": "component"
+      }
+    ],
+    "edges": [
+      {"parent": "GlobalMfg", "child": "PlastiCo", "description": "GlobalMfg lists PlastiCo as Tier-1 plastics supplier"}
+    ]
+  }
+}

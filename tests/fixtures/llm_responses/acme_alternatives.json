@@ -1,0 +1,47 @@
+{
+  "company": "ACME",
+  "alternatives": [
+    {
+      "alternative_for": "ChipWorks",
+      "hazard_type": "earthquake",
+      "candidates": [
+        {
+          "name": "SilconValley Semicon",
+          "lat": 52.52,
+          "lon": 13.405,
+          "confidence": 0.80,
+          "rationale": "Berlin is in a low-seismicity zone within the stable European plate, reducing earthquake disruption risk."
+        },
+        {
+          "name": "MalaysiaChip Corp",
+          "lat": 3.14,
+          "lon": 101.69,
+          "confidence": 0.72,
+          "rationale": "Kuala Lumpur sits on the stable Sunda Shelf with minimal recorded seismicity."
+        }
+      ],
+      "rationale": "ChipWorks in Tokyo (score 100/100 earthquake) is exposed to frequent M4+ seismicity on the Pacific Ring of Fire. Alternatives in low-seismicity regions significantly reduce earthquake disruption risk."
+    },
+    {
+      "alternative_for": "SteelCorp",
+      "hazard_type": "drought",
+      "candidates": [
+        {
+          "name": "NorthSteel AB",
+          "lat": 59.33,
+          "lon": 18.07,
+          "confidence": 0.78,
+          "rationale": "Stockholm receives consistent precipitation year-round with minimal drought risk."
+        },
+        {
+          "name": "GreatLakes Steel",
+          "lat": 42.33,
+          "lon": -83.05,
+          "confidence": 0.75,
+          "rationale": "Detroit is adjacent to the Great Lakes, providing reliable water supply and low drought exposure."
+        }
+      ],
+      "rationale": "SteelCorp in San Francisco (score 100/100 drought) faces severe dry-month patterns. Alternatives in water-abundant northern regions reduce water-stress risk."
+    }
+  ]
+}

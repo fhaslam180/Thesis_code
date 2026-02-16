@@ -1,0 +1,28 @@
+{
+  "parent_company": "ACME",
+  "tier": 1,
+  "suppliers": [
+    {
+      "name": "SteelCorp",
+      "lat": 37.7749,
+      "lon": -122.4194,
+      "confidence": 0.9,
+      "rationale": "ACME sources structural steel from SteelCorp, a major steel manufacturer based in San Francisco.",
+      "industry": "Steel Manufacturing",
+      "product_category": "Structural steel",
+      "location_description": "San Francisco, USA",
+      "relationship_type": "raw_material"
+    },
+    {
+      "name": "ChipWorks",
+      "lat": 35.6762,
+      "lon": 139.6503,
+      "confidence": 0.85,
+      "rationale": "ACME procures semiconductor components from ChipWorks, headquartered in Tokyo, Japan.",
+      "industry": "Semiconductor Manufacturing",
+      "product_category": "Microcontrollers",
+      "location_description": "Tokyo, Japan",
+      "relationship_type": "component"
+    }
+  ]
+}
