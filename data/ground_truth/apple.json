@@ -1,0 +1,34 @@
+{
+  "company": "Apple",
+  "source": "Apple Supplier List 2024 (publicly published)",
+  "notes": "Top suppliers extracted from Apple's annual supplier responsibility report. Names normalised to match common LLM output.",
+  "tier_1_suppliers": [
+    "Foxconn",
+    "TSMC",
+    "Samsung",
+    "LG Display",
+    "SK Hynix",
+    "Murata Manufacturing",
+    "Broadcom",
+    "Texas Instruments",
+    "STMicroelectronics",
+    "Sony",
+    "Qualcomm",
+    "Intel",
+    "Corning",
+    "BOE Technology",
+    "Luxshare",
+    "Pegatron",
+    "Wistron",
+    "Jabil",
+    "Nidec",
+    "TDK"
+  ],
+  "tier_2_suppliers": [
+    "ASML",
+    "Shin-Etsu Chemical",
+    "Sumitomo Chemical",
+    "JSR Corporation",
+    "Tokyo Electron"
+  ]
+}

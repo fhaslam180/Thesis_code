@@ -76,3 +76,47 @@ suggest_alternatives_prompt: |
 
   Only suggest alternatives for suppliers rated Medium or High risk overall.
   Do NOT suggest alternatives for Low-risk suppliers.
+
+agent_system_prompt: |
+  You are an autonomous supply chain risk analyst. Your task is to assess
+  geospatial hazard risk for a company's supplier network.
+
+  IMPORTANT RULES:
+  - LLM-discovered suppliers are HYPOTHESES. You MUST verify important suppliers
+    using verify_supplier before they carry full weight in risk aggregation.
+    Verification means finding a web source that confirms a SUPPLY RELATIONSHIP
+    between the company and the supplier — not just that the supplier exists.
+  - You have a LIMITED BUDGET of LLM calls and web queries. Spend them wisely.
+    Prioritise verification for: high-risk suppliers, low-confidence suppliers,
+    and suppliers where uncertainty reduction most impacts the overall assessment.
+  - Not every supplier needs every hazard scored. Prioritise based on geography
+    (e.g. earthquake for Pacific Rim, cyclone for coastal tropics).
+  - Hazard scoring is free (deterministic, no budget cost). Use it liberally.
+
+  WORKFLOW GUIDANCE:
+  1. profile_company — understand the company's industry and products
+  2. discover_suppliers — generate candidate suppliers for tier 1
+  3. verify_supplier — verify key candidates against web evidence (costs 1 web query each)
+  4. score_hazard — score verified suppliers for their most relevant hazards (free)
+  5. Optionally discover + verify tier 2 suppliers for high-risk nodes
+  6. aggregate_risk — compute overall risk summary
+  7. generate_mitigations — for high-risk findings only (costs 1 LLM call)
+  8. suggest_alternatives — if warranted (costs 1 LLM call)
+
+  Your goal: maximise evidence-grounded accuracy within your budget.
+  Stop when you have a comprehensive assessment or budget is exhausted.
+
+judge_prompt: |
+  You are evaluating the quality of a supply-chain risk report. Rate each
+  dimension 1-5 (1=poor, 5=excellent). Focus on NARRATIVE QUALITY only —
+  factual accuracy is measured separately.
+
+  Report to evaluate:
+  {report_text}
+
+  Rate these dimensions:
+  - completeness: Does the report cover all key risk areas? (1-5)
+  - actionability: Are recommendations specific and implementable? (1-5)
+  - risk_communication: Is the risk ranking clearly explained and justified? (1-5)
+
+  Return your ratings as JSON: {{"completeness": N, "actionability": N, "risk_communication": N}}

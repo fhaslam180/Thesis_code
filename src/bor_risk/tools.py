@@ -30,6 +30,9 @@ from bor_risk.models import (
 )
 from bor_risk.utils import load_prompts
 
+# Lazy import to avoid circular dependency / missing tavily in test env.
+_search_module = None
+
 _DEFAULT_SUPPLIERS_PATH = (
     Path(__file__).resolve().parent.parent.parent
     / "tests" / "fixtures" / "mock_suppliers.json"
@@ -546,7 +549,16 @@ def compute_risk_summary(
         info = supplier_meta.get(supplier_name, {})
         confidence = float(info.get("confidence", 1.0))
         tier = int(info.get("tier", 1))
-        confidence_factor = 0.5 + (0.5 * confidence)
+
+        # Evidence-source weighting: unverified LLM suppliers get halved
+        # confidence to reflect epistemic uncertainty.
+        evidence_source = info.get("evidence_source", "fixture")
+        if evidence_source == "llm_only":
+            effective_confidence = confidence * 0.5
+        else:
+            effective_confidence = confidence
+
+        confidence_factor = 0.5 + (0.5 * effective_confidence)
         tier_factor = max(0.8, 1.0 - (0.05 * max(0, tier - 1)))
         risk_score = round(weighted * confidence_factor * tier_factor, 4)
 
@@ -947,3 +959,109 @@ def suggest_alternatives_llm(
     )
 
     return [a.model_dump() for a in response.alternatives]
+
+
+# ---------------------------------------------------------------------------
+# Pipeline web verification (Condition B — deterministic order)
+# ---------------------------------------------------------------------------
+
+_RELATIONSHIP_CUES = frozenset({
+    "supplier", "vendor", "manufactures", "supplies",
+    "partner", "contract", "sources from", "procures from",
+    "supply chain", "component supplier",
+})
+
+
+def verify_suppliers_batch(
+    suppliers: list[dict],
+    company: str,
+    budget: "BudgetTracker",  # noqa: F821 — forward ref
+    snapshot_mode: bool = False,
+) -> list[dict]:
+    """Verify suppliers against web evidence in descending confidence order.
+
+    This is the deterministic pipeline verification (Condition B).
+    Suppliers are verified in a fixed order (highest confidence first)
+    until the web budget is exhausted. Uses the same co-mention +
+    relationship-cue matching as the agent's ``verify_supplier`` tool.
+
+    Parameters
+    ----------
+    suppliers : list[dict]
+        Supplier dicts from GraphState.
+    company : str
+        The target company name.
+    budget : BudgetTracker
+        Budget tracker; stops when web budget is exhausted.
+    snapshot_mode : bool
+        If *True*, only cached search results are used.
+
+    Returns
+    -------
+    list[dict]
+        Updated supplier dicts with ``evidence_source`` set to
+        ``"web_verified"`` where relationship evidence was found.
+    """
+    from bor_risk.search import search_web, search_web_snapshot
+
+    search_fn = search_web_snapshot if snapshot_mode else search_web
+
+    # Sort by descending confidence (deterministic order).
+    ordered = sorted(suppliers, key=lambda s: s.get("confidence", 0), reverse=True)
+    updated = {s["name"]: dict(s) for s in suppliers}
+    evidence_items: list[dict] = []
+
+    company_lower = company.lower()
+    web_evidence_counter = 1
+
+    for s in ordered:
+        if budget.web_budget_remaining <= 0:
+            break
+
+        supplier_name = s["name"]
+        supplier_lower = supplier_name.lower()
+        query = (
+            f'"{company}" "{supplier_name}" '
+            f"supplier OR vendor OR manufactures OR supplies"
+        )
+        budget.record_web_query(query=query)
+
+        try:
+            results = search_fn(query, max_results=3)
+        except Exception:
+            continue
+
+        verified = False
+        for r in results:
+            content_lower = r["content"].lower()
+            has_co_mention = (
+                company_lower in content_lower
+                and supplier_lower in content_lower
+            )
+            has_relationship = any(
+                cue in content_lower for cue in _RELATIONSHIP_CUES
+            )
+
+            if has_co_mention and has_relationship:
+                updated[supplier_name]["evidence_source"] = "web_verified"
+                updated[supplier_name]["verification_url"] = r["url"]
+                updated[supplier_name]["verification_snippet"] = r["content"][:300]
+                updated[supplier_name]["confidence"] = min(
+                    1.0, updated[supplier_name].get("confidence", 0.5) + 0.1
+                )
+                eid = f"W{web_evidence_counter}"
+                web_evidence_counter += 1
+                evidence_items.append({
+                    "evidence_id": eid,
+                    "source": f"web:{r['url']}",
+                    "description": r["content"][:300],
+                    "retrieved_at": r.get("retrieved_at", ""),
+                })
+                verified = True
+                break
+
+        if not verified:
+            # Supplier remains llm_only.
+            updated[supplier_name].setdefault("evidence_source", "llm_only")
+
+    return list(updated.values()), evidence_items

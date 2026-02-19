@@ -1,0 +1,29 @@
+{
+  "company": "Toyota",
+  "source": "Toyota Group supplier network (public knowledge, keiretsu relationships)",
+  "notes": "Major suppliers from Toyota's well-documented supply chain. Includes keiretsu members and key external suppliers.",
+  "tier_1_suppliers": [
+    "Denso",
+    "Aisin",
+    "Toyota Boshoku",
+    "JTEKT",
+    "Toyota Industries",
+    "Panasonic",
+    "Bridgestone",
+    "Sumitomo Electric",
+    "NTN Corporation",
+    "Koyo Seiko",
+    "Nippon Steel",
+    "Toray Industries",
+    "Continental",
+    "Bosch",
+    "Yazaki"
+  ],
+  "tier_2_suppliers": [
+    "Murata Manufacturing",
+    "Renesas Electronics",
+    "Rohm Semiconductor",
+    "Nidec",
+    "NGK Spark Plug"
+  ]
+}

@@ -13,7 +13,9 @@ from dotenv import load_dotenv
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
+from bor_risk.budget import BudgetTracker
 from bor_risk.graph import build_graph, run_graph
+from bor_risk.report import format_report
 from bor_risk.sensitivity import format_sensitivity_report, run_sensitivity
 from bor_risk.utils import ensure_dir, sanitize_company_name
 
@@ -21,6 +23,7 @@ from bor_risk.utils import ensure_dir, sanitize_company_name
 # Node-name -> human-readable label for streaming output.
 _NODE_LABELS: dict[str, str] = {
     "discover_suppliers": "Discovering suppliers",
+    "verify_suppliers": "Verifying suppliers against web evidence",
     "score_earthquake": "Scoring earthquake hazard",
     "score_flood": "Scoring flood hazard",
     "score_wildfire": "Scoring wildfire hazard",
@@ -45,6 +48,12 @@ def _print_node_complete(node_name: str, state_update: dict) -> None:
     if node_name == "discover_suppliers":
         suppliers = state_update.get("suppliers", [])
         detail = f" ({len(suppliers)} found)"
+    elif node_name == "verify_suppliers":
+        suppliers = state_update.get("suppliers", [])
+        verified = sum(
+            1 for s in suppliers if s.get("evidence_source") == "web_verified"
+        )
+        detail = f" ({verified} verified)"
     elif node_name == "aggregate_risk":
         summary = state_update.get("company_risk_summary", {})
         score = summary.get("company_score", 0)
@@ -62,19 +71,20 @@ def _write_outputs(state: dict, out_dir: Path, prefix: str) -> None:
     report_path = out_dir / f"{prefix}_report.txt"
     report_path.write_text(state["report_text"], encoding="utf-8")
 
+    graph_data: dict = {
+        "suppliers": state["suppliers"],
+        "edges": state["edges"],
+        "company_risk_summary": state.get("company_risk_summary", {}),
+        "workflow_decision": state.get("workflow_decision", {}),
+        "workflow_actions": state.get("workflow_actions", []),
+        "workflow_trace": state.get("workflow_trace", []),
+    }
+    if state.get("budget_summary"):
+        graph_data["budget_summary"] = state["budget_summary"]
+
     graph_path = out_dir / f"{prefix}_graph.json"
     graph_path.write_text(
-        json.dumps(
-            {
-                "suppliers": state["suppliers"],
-                "edges": state["edges"],
-                "company_risk_summary": state.get("company_risk_summary", {}),
-                "workflow_decision": state.get("workflow_decision", {}),
-                "workflow_actions": state.get("workflow_actions", []),
-                "workflow_trace": state.get("workflow_trace", []),
-            },
-            indent=2,
-        ),
+        json.dumps(graph_data, indent=2),
         encoding="utf-8",
     )
 
@@ -93,12 +103,13 @@ def _run_interactive(
     tier_depth: int,
     suppliers_path: str | None,
     use_llm: bool,
+    enable_web: bool = False,
 ) -> dict:
     """Run the graph with streaming output and human-in-the-loop."""
     print(f"Analysing supply-chain risk for {company}...\n")
 
     checkpointer = MemorySaver()
-    graph = build_graph().compile(checkpointer=checkpointer)
+    graph = build_graph(enable_web=enable_web).compile(checkpointer=checkpointer)
     thread_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
 
@@ -107,6 +118,7 @@ def _run_interactive(
         "tier_depth": tier_depth,
         "use_llm": use_llm,
         "interactive": True,
+        "enable_web": enable_web,
         "hazard_scores": [],
         "workflow_trace": [],
     }
@@ -162,6 +174,50 @@ def _run_interactive(
     return graph.get_state(config).values
 
 
+def _run_agent_mode(
+    company: str,
+    tier_depth: int,
+    enable_web: bool,
+    budget_llm: int,
+    budget_web: int,
+    snapshot: bool,
+) -> dict:
+    """Run the autonomous ReAct agent (Conditions C and D)."""
+    from bor_risk.agent import run_agent
+
+    print(f"Running agent mode for {company}...")
+    print(f"  Budget: {budget_llm} LLM calls, {budget_web} web queries")
+    if not enable_web:
+        print("  Web search: DISABLED")
+    if snapshot:
+        print("  Snapshot mode: ON (cache only)")
+    print()
+
+    budget = BudgetTracker(
+        max_llm_calls=budget_llm,
+        max_web_queries=budget_web,
+    )
+    state = run_agent(
+        company=company,
+        tier_depth=tier_depth,
+        enable_web=enable_web,
+        budget=budget,
+        snapshot_mode=snapshot,
+    )
+
+    # Generate report text using the same formatter.
+    state["report_text"] = format_report(state)
+
+    # Print budget summary.
+    bs = state.get("budget_summary", {})
+    print(f"\n  Budget used: {bs.get('llm_calls', 0)}/{budget_llm} LLM, "
+          f"{bs.get('web_queries', 0)}/{budget_web} web, "
+          f"{bs.get('hazard_scores', 0)} hazard scores")
+    print(f"  Wall clock: {bs.get('wall_clock_seconds', 0):.1f}s")
+
+    return state
+
+
 def main(argv: list[str] | None = None) -> None:
     load_dotenv()
 
@@ -179,6 +235,16 @@ def main(argv: list[str] | None = None) -> None:
         "--out",
         required=True,
         help="Output path (directory derived from this, e.g. outputs/acme.txt)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["pipeline", "pipeline-web", "agent", "agent-web"],
+        default="pipeline",
+        help=(
+            "Experimental condition: "
+            "pipeline (A), pipeline-web (B), agent (C), agent-web (D). "
+            "Default: pipeline."
+        ),
     )
     parser.add_argument(
         "--no-llm",
@@ -205,11 +271,29 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Print a Mermaid diagram of the graph and exit.",
     )
+    parser.add_argument(
+        "--budget-llm",
+        type=int,
+        default=20,
+        help="Max LLM calls for agent/pipeline-web modes (default: 20).",
+    )
+    parser.add_argument(
+        "--budget-web",
+        type=int,
+        default=30,
+        help="Max web queries for agent-web/pipeline-web modes (default: 30).",
+    )
+    parser.add_argument(
+        "--snapshot",
+        action="store_true",
+        help="Use cached web results only (for reproducible evaluation).",
+    )
     args = parser.parse_args(argv)
 
     # --visualize: print Mermaid diagram and exit.
     if args.visualize:
-        graph = build_graph().compile()
+        enable_web = args.mode in ("pipeline-web", "agent-web")
+        graph = build_graph(enable_web=enable_web).compile()
         print(graph.get_graph().draw_mermaid())
         return
 
@@ -220,18 +304,35 @@ def main(argv: list[str] | None = None) -> None:
 
     use_llm = not args.no_llm
 
-    if args.interactive:
-        # Interactive path: streaming + human-in-the-loop.
+    if args.mode in ("agent", "agent-web"):
+        # Agent modes (Conditions C and D).
+        enable_web = args.mode == "agent-web"
+        state = _run_agent_mode(
+            args.company,
+            args.tier_depth,
+            enable_web=enable_web,
+            budget_llm=args.budget_llm,
+            budget_web=args.budget_web,
+            snapshot=args.snapshot,
+        )
+    elif args.interactive:
+        # Interactive pipeline path: streaming + human-in-the-loop.
+        enable_web = args.mode == "pipeline-web"
         state = _run_interactive(
             args.company, args.tier_depth, args.suppliers_path, use_llm,
+            enable_web=enable_web,
         )
     else:
-        # Non-interactive path: backward-compatible (tests patch this).
+        # Pipeline modes (Conditions A and B).
+        enable_web = args.mode == "pipeline-web"
         state = run_graph(
             args.company,
             args.tier_depth,
             suppliers_path=args.suppliers_path,
             use_llm=use_llm,
+            enable_web=enable_web,
+            max_web_queries=args.budget_web,
+            snapshot_mode=args.snapshot,
         )
 
     # Optional sensitivity analysis (appended to report + separate JSON).

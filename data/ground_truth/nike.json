@@ -1,0 +1,23 @@
+{
+  "company": "Nike",
+  "source": "Nike Manufacturing Map (publicly published)",
+  "notes": "Major contract manufacturers and material suppliers from Nike's transparency reports.",
+  "tier_1_suppliers": [
+    "Pou Chen Group",
+    "Feng Tay",
+    "Chang Shin",
+    "Yue Yuen Industrial",
+    "Eclat Textile",
+    "Shenzhou International",
+    "Hansae",
+    "Pacific Textiles",
+    "Far Eastern New Century",
+    "Makalot Industrial"
+  ],
+  "tier_2_suppliers": [
+    "Dow Chemical",
+    "BASF",
+    "Indorama Ventures",
+    "Toray Industries"
+  ]
+}

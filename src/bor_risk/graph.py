@@ -26,6 +26,7 @@ from langgraph.types import interrupt
 
 from bor_risk.models import GraphState, Supplier
 from bor_risk.report import format_report
+from bor_risk.budget import BudgetTracker
 from bor_risk.tools import (
     compute_hazard,
     compute_risk_summary,
@@ -34,6 +35,7 @@ from bor_risk.tools import (
     load_suppliers,
     resolve_company_profile,
     suggest_alternatives_llm,
+    verify_suppliers_batch,
 )
 from bor_risk.utils import load_hazards
 
@@ -85,6 +87,42 @@ def discover_suppliers_node(state: GraphState) -> GraphState:
     if company_profile:
         result["company_profile"] = company_profile
 
+    return result
+
+
+def verify_suppliers_node(state: GraphState) -> GraphState:
+    """Node 1B: Verify suppliers against web evidence (Condition B only).
+
+    Verifies suppliers in descending confidence order until the web
+    budget is exhausted. Only inserted when ``enable_web=True``.
+    """
+    enable_web = state.get("enable_web", False)
+    if not enable_web:
+        return {"workflow_trace": ["verify_suppliers(skipped)"]}
+
+    budget = BudgetTracker(
+        max_web_queries=state.get("_max_web_queries", 30),
+    )
+    snapshot_mode = state.get("snapshot_mode", False)
+
+    updated_suppliers, web_evidence = verify_suppliers_batch(
+        state.get("suppliers", []),
+        state.get("company", ""),
+        budget,
+        snapshot_mode=snapshot_mode,
+    )
+
+    verified_count = sum(
+        1 for s in updated_suppliers if s.get("evidence_source") == "web_verified"
+    )
+
+    result: dict = {
+        "suppliers": updated_suppliers,
+        "evidence": state.get("evidence", []) + web_evidence,
+        "workflow_trace": [f"verify_suppliers({verified_count})"],
+    }
+    if budget.summary():
+        result["budget_summary"] = budget.summary()
     return result
 
 
@@ -325,12 +363,19 @@ def route_workflow(state: GraphState) -> str:
 # ---------------------------------------------------------------------------
 
 
-def build_graph() -> StateGraph:
+def build_graph(enable_web: bool = False) -> StateGraph:
     """Construct the LangGraph StateGraph (not yet compiled).
+
+    Parameters
+    ----------
+    enable_web : bool
+        When *True*, inserts a ``verify_suppliers`` node between
+        discovery and hazard scoring (Condition B: pipeline + web).
 
     Topology (parallel fan-out / fan-in)::
 
         START -> discover_suppliers
+              -> [verify_suppliers]  (only when enable_web=True)
               -> [score_earthquake | score_flood | score_wildfire |
                   score_cyclone | score_heat_stress | score_drought]
               -> aggregate_risk -> decide_workflow
@@ -342,6 +387,8 @@ def build_graph() -> StateGraph:
 
     # -- Nodes --
     g.add_node("discover_suppliers", discover_suppliers_node)
+    if enable_web:
+        g.add_node("verify_suppliers", verify_suppliers_node)
     for name, scorer_fn in _HAZARD_SCORER_NODES.items():
         g.add_node(f"score_{name}", scorer_fn)
     g.add_node("aggregate_risk", aggregate_risk_node)
@@ -355,9 +402,16 @@ def build_graph() -> StateGraph:
     # -- Edges --
     g.add_edge(START, "discover_suppliers")
 
-    # Fan-out: discover -> 6 parallel hazard scorers
+    if enable_web:
+        # discover -> verify -> fan-out to hazard scorers
+        g.add_edge("discover_suppliers", "verify_suppliers")
+        fan_out_source = "verify_suppliers"
+    else:
+        fan_out_source = "discover_suppliers"
+
+    # Fan-out: source -> 6 parallel hazard scorers
     for name in HAZARD_NAMES:
-        g.add_edge("discover_suppliers", f"score_{name}")
+        g.add_edge(fan_out_source, f"score_{name}")
 
     # Fan-in: all 6 hazard scorers -> aggregate_risk
     for name in HAZARD_NAMES:
@@ -388,6 +442,9 @@ def run_graph(
     suppliers_path: Path | str | None = None,
     use_llm: bool = False,
     interactive: bool = False,
+    enable_web: bool = False,
+    max_web_queries: int = 30,
+    snapshot_mode: bool = False,
 ) -> dict:
     """Compile the graph, invoke it, and return the final state.
 
@@ -397,9 +454,16 @@ def run_graph(
         When *True* and the risk is high, the graph pauses at
         ``decide_workflow`` for human approval via ``interrupt()``.
         Default *False* for backward compatibility and testing.
+    enable_web : bool
+        When *True*, inserts a verification node that checks suppliers
+        against web evidence (Condition B: pipeline + web).
+    max_web_queries : int
+        Maximum web queries for the verification node.
+    snapshot_mode : bool
+        When *True*, web verification uses cached results only.
     """
     checkpointer = MemorySaver()
-    graph = build_graph().compile(checkpointer=checkpointer)
+    graph = build_graph(enable_web=enable_web).compile(checkpointer=checkpointer)
     thread_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
 
@@ -408,9 +472,13 @@ def run_graph(
         "tier_depth": tier_depth,
         "use_llm": use_llm,
         "interactive": interactive,
+        "enable_web": enable_web,
+        "snapshot_mode": snapshot_mode,
         "hazard_scores": [],
         "workflow_trace": [],
     }
+    if enable_web:
+        init_state["_max_web_queries"] = max_web_queries
     if suppliers_path is not None:
         init_state["suppliers_path"] = str(suppliers_path)
     result = graph.invoke(init_state, config)

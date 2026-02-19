@@ -22,6 +22,9 @@ class Supplier(BaseModel):
     product_category: str = ""
     location_description: str = ""
     relationship_type: str = ""
+    evidence_source: str = "llm_only"  # "llm_only" | "web_verified" | "fixture"
+    verification_url: str = ""
+    verification_snippet: str = ""
 
 
 class Evidence(BaseModel):
@@ -199,3 +202,8 @@ class GraphState(TypedDict, total=False):
     suggested_alternatives: list[dict]
     workflow_trace: Annotated[list[str], operator.add]
     report_text: str
+    enable_web: bool
+    snapshot_mode: bool
+    agent_trace: list[dict]
+    budget_summary: dict
+    _max_web_queries: int
