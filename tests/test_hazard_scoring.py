@@ -92,7 +92,7 @@ class TestUSGSEarthquakeScoring:
         assert score.level == "Low"
 
     def test_high_count_gives_max_score(self, mock_urlopen) -> None:
-        mock_urlopen.side_effect = _mock_urlopen_count(1072)
+        mock_urlopen.side_effect = _mock_urlopen_count(5000)
         score = compute_hazard(
             _make_supplier("TokyoCo", lat=35.67, lon=139.65),
             hazard_type="earthquake",
@@ -107,7 +107,7 @@ class TestUSGSEarthquakeScoring:
             _make_supplier("SFCo", lat=37.77, lon=-122.42),
             hazard_type="earthquake",
         )
-        expected = round(min(1.0, math.log10(1 + 46) / 3.0), 4)
+        expected = round(min(1.0, math.log10(1 + 46) / 3.5), 4)
         assert score.score == expected
 
     def test_passes_correct_lat_lon_to_api(self, mock_urlopen) -> None:

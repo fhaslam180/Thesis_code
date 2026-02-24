@@ -46,6 +46,29 @@ class TestExecutiveSummary:
         assert "critical" in section
 
 
+class TestNarrativeSections:
+    """Tests for prose-first narrative report sections."""
+
+    def test_introduction_present(self) -> None:
+        report = _acme_state()["report_text"]
+        assert "--- Introduction ---" in report
+
+    def test_narrative_assessment_present(self) -> None:
+        report = _acme_state()["report_text"]
+        assert "--- Narrative Assessment ---" in report
+
+    def test_narrative_assessment_has_multiple_paragraphs(self) -> None:
+        report = _acme_state()["report_text"]
+        idx = report.index("--- Narrative Assessment ---")
+        section = report[idx:]
+        # Expect blank-line paragraph breaks in the narrative section.
+        assert section.count("\n\n") >= 3
+
+    def test_detailed_data_appendix_marker_present(self) -> None:
+        report = _acme_state()["report_text"]
+        assert "--- Detailed Data Appendix ---" in report
+
+
 class TestRiskRegisterMatrix:
     """Tests for the risk register matrix section."""
 

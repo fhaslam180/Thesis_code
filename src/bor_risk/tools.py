@@ -134,7 +134,7 @@ def _fetch_usgs_earthquake_count(lat: float, lon: float) -> int:
 
 def _score_earthquake(supplier: Supplier) -> HazardScore:
     count = _fetch_usgs_earthquake_count(supplier.lat, supplier.lon)
-    raw = min(1.0, math.log10(1 + count) / 3.0)
+    raw = min(1.0, math.log10(1 + count) / 3.5)
     return _build_hazard_score(
         supplier.name,
         "earthquake",
@@ -199,7 +199,13 @@ def _fetch_flood_data(lat: float, lon: float) -> dict:
 def _score_flood(supplier: Supplier) -> HazardScore:
     stats = _fetch_flood_data(supplier.lat, supplier.lon)
     days_above = stats.get("days_above_2x_mean", 0)
-    raw = min(1.0, days_above / 365.0)
+    total_days = stats.get("total_days", 0)
+    if total_days > 0:
+        years = total_days / 365.25
+        annual_flood_days = days_above / years
+    else:
+        annual_flood_days = 0.0
+    raw = min(1.0, annual_flood_days / 90.0)
     return _build_hazard_score(
         supplier.name,
         "flood",
@@ -214,7 +220,8 @@ def _score_flood(supplier: Supplier) -> HazardScore:
             "mean_discharge_m3s": stats.get("mean_discharge", 0.0),
             "max_discharge_m3s": stats.get("max_discharge", 0.0),
             "days_above_2x_mean": days_above,
-            "total_days": stats.get("total_days", 0),
+            "annual_flood_days": round(annual_flood_days, 1),
+            "total_days": total_days,
             "resolution_km": 5,
         },
     )
@@ -264,7 +271,7 @@ def _fetch_heat_data(lat: float, lon: float) -> dict:
 def _score_heat_stress(supplier: Supplier) -> HazardScore:
     stats = _fetch_heat_data(supplier.lat, supplier.lon)
     annual = stats.get("annual_extreme_heat_days", 0.0)
-    raw = min(1.0, annual / 90.0)
+    raw = min(1.0, annual / 130.0)
     return _build_hazard_score(
         supplier.name,
         "heat_stress",
@@ -338,7 +345,7 @@ def _fetch_precipitation_data(lat: float, lon: float) -> dict:
 def _score_drought(supplier: Supplier) -> HazardScore:
     stats = _fetch_precipitation_data(supplier.lat, supplier.lon)
     fraction = stats.get("dry_month_fraction", 0.0)
-    raw = min(1.0, fraction * 2.0)
+    raw = min(1.0, fraction * 1.5)
     return _build_hazard_score(
         supplier.name,
         "drought",
@@ -669,6 +676,7 @@ def load_suppliers(
             product_category=raw.get("product_category", ""),
             location_description=raw.get("location_description", ""),
             relationship_type=raw.get("relationship_type", ""),
+            evidence_source="fixture",
         ))
 
     # Prune edges and evidence to only surviving suppliers
@@ -816,6 +824,7 @@ def discover_suppliers_llm(
                     product_category=llm_sup.product_category,
                     location_description=llm_sup.location_description,
                     relationship_type=llm_sup.relationship_type,
+                    evidence_source="llm_only",
                 ))
                 all_edges.append({
                     "parent": parent,

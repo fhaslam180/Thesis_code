@@ -207,3 +207,4 @@ class GraphState(TypedDict, total=False):
     agent_trace: list[dict]
     budget_summary: dict
     _max_web_queries: int
+    _budget_tracker: object  # BudgetTracker instance, not serialised

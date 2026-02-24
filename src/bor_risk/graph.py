@@ -61,17 +61,27 @@ def discover_suppliers_node(state: GraphState) -> GraphState:
     company = state["company"]
     tier_depth = state.get("tier_depth", 2)
     use_llm = state.get("use_llm", False)
+    budget = state.get("_budget_tracker")
 
     company_profile: dict = {}
 
     if use_llm:
         try:
             company_profile = resolve_company_profile(company)
+            if budget:
+                budget.record_llm_call(purpose="profile_company")
         except Exception:
             company_profile = {}
         suppliers, edges, evidence = discover_suppliers_llm(
             company, tier_depth, company_profile=company_profile or None,
         )
+        # Record one LLM call per (parent, tier) pair in discovery.
+        if budget:
+            parents = [company]
+            for tier in range(1, tier_depth + 1):
+                for parent in parents:
+                    budget.record_llm_call(purpose=f"discover_tier{tier}_{parent}")
+                parents = [s.name for s in suppliers if s.tier == tier]
     else:
         suppliers_path = state.get("suppliers_path")
         suppliers, edges, evidence = load_suppliers(
@@ -100,9 +110,12 @@ def verify_suppliers_node(state: GraphState) -> GraphState:
     if not enable_web:
         return {"workflow_trace": ["verify_suppliers(skipped)"]}
 
-    budget = BudgetTracker(
-        max_web_queries=state.get("_max_web_queries", 30),
-    )
+    # Use shared budget tracker if available, otherwise create one.
+    budget = state.get("_budget_tracker")
+    if budget is None:
+        budget = BudgetTracker(
+            max_web_queries=state.get("_max_web_queries", 30),
+        )
     snapshot_mode = state.get("snapshot_mode", False)
 
     updated_suppliers, web_evidence = verify_suppliers_batch(
@@ -116,14 +129,11 @@ def verify_suppliers_node(state: GraphState) -> GraphState:
         1 for s in updated_suppliers if s.get("evidence_source") == "web_verified"
     )
 
-    result: dict = {
+    return {
         "suppliers": updated_suppliers,
         "evidence": state.get("evidence", []) + web_evidence,
         "workflow_trace": [f"verify_suppliers({verified_count})"],
     }
-    if budget.summary():
-        result["budget_summary"] = budget.summary()
-    return result
 
 
 # -- Parallel hazard scoring (fan-out / fan-in) ----------------------------
@@ -309,6 +319,9 @@ def generate_mitigations_node(state: GraphState) -> GraphState:
                 hazard_scores=state.get("hazard_scores", []),
                 summary=state.get("company_risk_summary", {}),
             )
+            budget = state.get("_budget_tracker")
+            if budget:
+                budget.record_llm_call(purpose="generate_mitigations")
         except Exception:
             mitigations = []
 
@@ -331,6 +344,9 @@ def suggest_alternatives_node(state: GraphState) -> GraphState:
                 hazard_scores=state.get("hazard_scores", []),
                 summary=state.get("company_risk_summary", {}),
             )
+            budget = state.get("_budget_tracker")
+            if budget:
+                budget.record_llm_call(purpose="suggest_alternatives")
         except Exception:
             alternatives = []
 
@@ -341,15 +357,26 @@ def suggest_alternatives_node(state: GraphState) -> GraphState:
 
 
 def format_report_node(state: GraphState) -> GraphState:
-    """Node 7: Generate the plain-text report.
+    """Node 8: Generate the plain-text report.
 
     Builds the full trace locally (including ``format_report``) so the
     report renderer can display it, but returns only ``["format_report"]``
     for the ``operator.add`` reducer.
     """
+    # Write budget summary from shared tracker before rendering.
+    budget = state.get("_budget_tracker")
+    budget_summary = budget.summary() if budget else state.get("budget_summary", {})
+
     full_trace = [*state.get("workflow_trace", []), "format_report"]
-    report_text = format_report({**state, "workflow_trace": full_trace})
-    return {"report_text": report_text, "workflow_trace": ["format_report"]}
+    report_state = {**state, "workflow_trace": full_trace, "budget_summary": budget_summary}
+    report_text = format_report(report_state)
+    result: dict = {
+        "report_text": report_text,
+        "workflow_trace": ["format_report"],
+    }
+    if budget_summary:
+        result["budget_summary"] = budget_summary
+    return result
 
 
 def route_workflow(state: GraphState) -> str:
@@ -445,6 +472,7 @@ def run_graph(
     enable_web: bool = False,
     max_web_queries: int = 30,
     snapshot_mode: bool = False,
+    budget: BudgetTracker | None = None,
 ) -> dict:
     """Compile the graph, invoke it, and return the final state.
 
@@ -461,6 +489,8 @@ def run_graph(
         Maximum web queries for the verification node.
     snapshot_mode : bool
         When *True*, web verification uses cached results only.
+    budget : BudgetTracker | None
+        Shared budget tracker for recording LLM/web usage across nodes.
     """
     checkpointer = MemorySaver()
     graph = build_graph(enable_web=enable_web).compile(checkpointer=checkpointer)
@@ -477,6 +507,8 @@ def run_graph(
         "hazard_scores": [],
         "workflow_trace": [],
     }
+    if budget is not None:
+        init_state["_budget_tracker"] = budget
     if enable_web:
         init_state["_max_web_queries"] = max_web_queries
     if suppliers_path is not None:

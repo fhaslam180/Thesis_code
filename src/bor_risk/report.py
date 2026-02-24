@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections import defaultdict
 from datetime import date
 
@@ -41,29 +42,146 @@ _DATASET_URLS: dict[str, tuple[str, str]] = {
 # ---------------------------------------------------------------------------
 
 
+def _humanize_hazard(hazard: str) -> str:
+    """Render machine hazard names as readable text."""
+    return hazard.replace("_", " ")
+
+
+def _join_with_and(items: list[str]) -> str:
+    """Join text fragments using natural language rules."""
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
 def _build_executive_summary(
     company: str,
     suppliers: list[dict],
     summary: dict,
 ) -> list[str]:
-    """Deterministic executive summary paragraph."""
+    """Deterministic executive summary with human-readable narrative."""
     score = summary.get("company_score", 0.0)
     band = summary.get("risk_band", "unknown")
     critical_count = summary.get("critical_alert_count", 0)
     supplier_risks = summary.get("supplier_risks", [])
+    hazard_alerts = summary.get("hazard_alerts", [])
 
     top_name = supplier_risks[0]["supplier_name"] if supplier_risks else "N/A"
     top_score = supplier_risks[0]["risk_score"] if supplier_risks else 0.0
+    top_three = [
+        f"{item['supplier_name']} ({item['risk_score']:.2f})"
+        for item in supplier_risks[:3]
+    ]
+    hazard_counts = Counter(alert["hazard_type"] for alert in hazard_alerts)
+    dominant_hazards = [
+        f"{_humanize_hazard(name)} ({count})"
+        for name, count in hazard_counts.most_common(2)
+    ]
+
+    supplier_phrase = ""
+    if top_three:
+        supplier_phrase = (
+            f" The top {len(top_three)} supplier(s) by risk are "
+            f"{_join_with_and(top_three)}."
+        )
+    overview_paragraph = (
+        f"  Overall exposure is {band.upper()} (composite score: {score:.4f}). "
+        f"The highest-risk supplier is {top_name} with a score of {top_score:.4f}."
+        f"{supplier_phrase}"
+    )
 
     lines = [
         "--- Executive Summary ---",
         "",
-        f"  This report assesses the supply-chain risk exposure of {company} across "
-        f"{len(suppliers)} analysed supplier(s). The overall company risk band is "
-        f"{band.upper()} (score: {score:.4f}). The highest-risk supplier is "
-        f"{top_name} with a composite risk score of {top_score:.4f}. "
-        f"{critical_count} critical threshold alert(s) were identified"
-        + (" requiring immediate attention." if critical_count > 0 else "."),
+        f"  This report provides a narrative assessment of {company}'s supply-chain "
+        f"hazard exposure across {len(suppliers)} analysed supplier(s).",
+        "",
+        overview_paragraph,
+        "",
+        f"  {critical_count} critical threshold alert(s) were identified"
+        + (" requiring immediate attention." if critical_count > 0 else ".")
+        + (
+            f" Alert concentration is highest in {_join_with_and(dominant_hazards)}."
+            if dominant_hazards else ""
+        ),
+        "",
+    ]
+    return lines
+
+
+def _build_narrative_assessment(
+    hazards: list[dict],
+    summary: dict,
+    decision: dict,
+    actions: list[dict],
+) -> list[str]:
+    """Narrative interpretation section before detailed data tables."""
+    supplier_risks = summary.get("supplier_risks", [])
+    top_suppliers = [
+        f"{item['supplier_name']} ({item['risk_score']:.2f})"
+        for item in supplier_risks[:5]
+    ]
+
+    by_hazard: dict[str, list[float]] = defaultdict(list)
+    high_count = 0
+    for hazard in hazards:
+        h_type = hazard.get("hazard_type", "unknown")
+        score = float(hazard.get("score", 0.0))
+        by_hazard[h_type].append(score)
+        if hazard.get("level") == "High":
+            high_count += 1
+
+    hazard_ranked = sorted(
+        (
+            (hazard, sum(scores) / len(scores), len(scores))
+            for hazard, scores in by_hazard.items()
+            if scores
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    top_hazards = [
+        f"{_humanize_hazard(hazard)} (avg {avg * 100:.0f}/100)"
+        for hazard, avg, _ in hazard_ranked[:3]
+    ]
+
+    route = decision.get("route", "n/a")
+    reason = decision.get("reason", "n/a")
+    action_text = _join_with_and([
+        f"[{a.get('priority', 'P2')}] {a.get('action', '').rstrip('.')}"
+        for a in actions[:3]
+        if a.get("action")
+    ])
+
+    lines = [
+        "--- Narrative Assessment ---",
+        "",
+        (
+            f"  Exposure is concentrated in a small subset of suppliers. "
+            f"The upper end of the risk distribution is led by "
+            f"{_join_with_and(top_suppliers[:3])}."
+            if top_suppliers
+            else "  Supplier-level concentration cannot be ranked because no supplier risk scores are available."
+        ),
+        "",
+        (
+            f"  Across all supplier-hazard combinations, {high_count} high-severity "
+            f"score(s) were recorded. The strongest hazard signals are "
+            f"{_join_with_and(top_hazards)}."
+            if top_hazards
+            else "  Hazard severity patterns cannot be profiled because no hazard scores are available."
+        ),
+        "",
+        (
+            f"  Workflow routing selected '{route}' ({reason}). "
+            f"Planned near-term actions are {action_text}."
+            if action_text
+            else f"  Workflow routing selected '{route}' ({reason}). No explicit planned actions were recorded."
+        ),
         "",
     ]
     return lines
@@ -237,6 +355,72 @@ def _build_ieee_references(hazards: list[dict]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Evidence source & budget sections
+# ---------------------------------------------------------------------------
+
+
+def _build_evidence_source_summary(suppliers: list[dict]) -> list[str]:
+    """Breakdown of supplier evidence sources."""
+    total = len(suppliers)
+    if total == 0:
+        return []
+
+    web_verified = sum(1 for s in suppliers if s.get("evidence_source") == "web_verified")
+    llm_only = sum(1 for s in suppliers if s.get("evidence_source") == "llm_only")
+    fixture = sum(1 for s in suppliers if s.get("evidence_source") == "fixture")
+
+    lines = ["", "--- Evidence Source Summary ---"]
+    lines.append(f"  Web-verified suppliers: {web_verified} / {total} "
+                 f"({100 * web_verified / total:.1f}%)")
+    lines.append(f"  LLM-only suppliers:    {llm_only} / {total} "
+                 f"({100 * llm_only / total:.1f}%)")
+    lines.append(f"  Fixture suppliers:     {fixture} / {total} "
+                 f"({100 * fixture / total:.1f}%)")
+    return lines
+
+
+def _build_budget_summary(state: GraphState) -> list[str]:
+    """Budget usage section."""
+    budget = state.get("budget_summary", {})
+    if not budget:
+        return []
+
+    lines = ["", "--- Budget Summary ---"]
+    llm_calls = budget.get("llm_calls", 0)
+    max_llm = budget.get("max_llm_calls", 0)
+    web_queries = budget.get("web_queries", 0)
+    max_web = budget.get("max_web_queries", 0)
+    hazard_scores = budget.get("hazard_scores", 0)
+    wall_clock = budget.get("wall_clock_seconds", 0)
+
+    lines.append(f"  LLM calls: {llm_calls} / {max_llm}")
+    lines.append(f"  Web queries: {web_queries} / {max_web}")
+    lines.append(f"  Hazard scores: {hazard_scores}")
+    lines.append(f"  Wall clock: {wall_clock:.1f}s")
+    return lines
+
+
+def _build_agent_trace_section(state: GraphState) -> list[str]:
+    """Agent trace section (only for agent modes)."""
+    agent_trace = state.get("agent_trace", [])
+    if not agent_trace:
+        return []
+
+    lines = ["", "--- Agent Trace ---"]
+    for i, step in enumerate(agent_trace, 1):
+        tool = step.get("tool", "unknown")
+        args = step.get("args", "")
+        result_summary = step.get("result_summary", "")
+        line = f"  {i}. {tool}"
+        if args:
+            line += f"({args})"
+        if result_summary:
+            line += f" -> {result_summary}"
+        lines.append(line)
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Main report builder
 # ---------------------------------------------------------------------------
 
@@ -266,21 +450,42 @@ def format_report(state: GraphState) -> str:
     company_profile = state.get("company_profile", {})
     if company_profile:
         lines.append("--- Company Profile ---")
-        lines.append(f"  Name: {company_profile.get('canonical_name', company)}")
-        lines.append(f"  Industry: {company_profile.get('industry', 'N/A')}")
+        cname = company_profile.get("canonical_name", company)
+        industry = company_profile.get("industry", "N/A")
+        hq = company_profile.get("headquarters", "N/A")
         products = company_profile.get("products", [])
-        if products:
-            lines.append(f"  Products: {', '.join(products)}")
-        lines.append(f"  Headquarters: {company_profile.get('headquarters', 'N/A')}")
+        product_text = ", ".join(products[:5]) if products else "n/a"
+        lines.append(
+            f"  {cname} operates in the {industry} sector and is headquartered in {hq}. "
+            f"Key products and services include {product_text}."
+        )
         desc = company_profile.get("description", "")
         if desc:
-            lines.append(f"  Description: {desc}")
+            lines.append("")
+            lines.append(f"  {desc}")
         lines.append("")
 
-    # Overview counts
-    lines.append(f"Suppliers analysed: {len(suppliers)}")
-    lines.append(f"Edges mapped: {len(edges)}")
-    lines.append(f"Evidence items: {len(evidence)}")
+    # Analysis scope in prose form.
+    lines += [
+        "--- Introduction ---",
+        "",
+        f"  The analysis covers {len(suppliers)} supplier node(s), {len(edges)} mapped "
+        f"relationship edge(s), and {len(evidence)} supporting evidence item(s). "
+        "Hazard scores are deterministic and derived from external geospatial "
+        "or climate datasets rather than LLM-estimated risk values.",
+        "",
+    ]
+
+    # Narrative interpretation up front (before data-heavy tables).
+    lines += _build_narrative_assessment(
+        hazards=hazards,
+        summary=summary,
+        decision=decision,
+        actions=actions,
+    )
+
+    # Evidence Source Summary
+    lines += _build_evidence_source_summary(suppliers)
 
     # Agent Workflow (unchanged markers)
     lines += [
@@ -302,7 +507,17 @@ def format_report(state: GraphState) -> str:
         for action in actions:
             lines.append(f"    - [{action['priority']}] {action['action']}")
 
-    # Supplier Risk Ranking (enriched with industry/location)
+    # Keep detailed sections grouped at the end as an appendix-style block.
+    lines += [
+        "",
+        "--- Detailed Data Appendix ---",
+        (
+            "  The sections below provide supplier-by-supplier and hazard-by-hazard "
+            "supporting data for auditability and follow-up analysis."
+        ),
+    ]
+
+    # Supplier Risk Ranking (enriched with industry/location/evidence)
     supplier_risks = summary.get("supplier_risks", [])
     supplier_map = {s["name"]: s for s in suppliers}
     if supplier_risks:
@@ -311,10 +526,13 @@ def format_report(state: GraphState) -> str:
         for item in supplier_risks:
             name = item["supplier_name"]
             info = supplier_map.get(name, {})
+            ev_source = info.get("evidence_source", "")
             line = (
                 f"  {name}: risk={item['risk_score']:.4f}, "
                 f"tier={item['tier']}, confidence={item['confidence']:.2f}"
             )
+            if ev_source:
+                line += f", source={ev_source}"
             industry = info.get("industry", "")
             product_cat = info.get("product_category", "")
             location_desc = info.get("location_description", "")
@@ -328,6 +546,10 @@ def format_report(state: GraphState) -> str:
             if extras:
                 line += f", {', '.join(extras)}"
             lines.append(line)
+            # Show verification URL for web-verified suppliers.
+            verification_url = info.get("verification_url", "")
+            if verification_url:
+                lines.append(f"    Verified: {verification_url}")
 
     # Threshold Alerts (unchanged)
     hazard_alerts = summary.get("hazard_alerts", [])
@@ -365,6 +587,12 @@ def format_report(state: GraphState) -> str:
 
     # Evidence Appendix (enhanced)
     lines += _build_evidence_appendix(evidence, hazards)
+
+    # Budget Summary
+    lines += _build_budget_summary(state)
+
+    # Agent Trace (agent modes only)
+    lines += _build_agent_trace_section(state)
 
     # IEEE References (enhanced)
     lines += _build_ieee_references(hazards)

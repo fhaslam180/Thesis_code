@@ -229,12 +229,12 @@ All hazard scores are deterministic and computed from real data — never from a
 
 | Hazard | Data Source | Formula | Parameters |
 |--------|------------|---------|------------|
-| Earthquake | USGS FDSNWS event count API | `min(1, log10(1 + count) / 3)` | M4.0+ quakes within 200 km, 2015–2025 |
-| Flood | Open-Meteo GloFAS river discharge | `min(1, days_above_2x_mean / 365)` | Daily discharge, days exceeding 2x mean |
+| Earthquake | USGS FDSNWS event count API | `min(1, log10(1 + count) / 3.5)` | M4.0+ quakes within 200 km, 2015–2025 |
+| Flood | Open-Meteo GloFAS river discharge | `min(1, annual_flood_days / 90)` | Annual days exceeding 2x mean discharge, 2015–2025 |
 | Wildfire | NASA FIRMS VIIRS (preprocessed grid) | `min(1, log10(1 + fire_count) / 4)` | 0.5-degree grid cells, annual fire detections |
 | Cyclone | NOAA IBTrACS (preprocessed grid) | `min(1, storm_count / 50)` | 1-degree grid cells, storms >= 34 kt, 1980–2024 |
-| Heat stress | Open-Meteo ERA5 reanalysis | `min(1, annual_extreme_days / 90)` | Days with apparent temp max > 35 C, 2015–2025 |
-| Drought | Open-Meteo ERA5 precipitation | `min(1, dry_month_fraction * 2)` | Months below 50% of mean monthly precipitation |
+| Heat stress | Open-Meteo ERA5 reanalysis | `min(1, annual_extreme_days / 130)` | Days with apparent temp max > 35 C, 2015–2025 |
+| Drought | Open-Meteo ERA5 precipitation | `min(1, dry_month_fraction * 1.5)` | Months below 50% of mean monthly precipitation |
 
 ## Risk Aggregation
 

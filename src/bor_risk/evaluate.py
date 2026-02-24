@@ -289,8 +289,9 @@ def run_condition(
             enable_web=enable_web,
             max_web_queries=budget.max_web_queries,
             snapshot_mode=snapshot,
+            budget=budget,
         )
-        # Record budget for pipeline runs.
+        # Ensure budget summary is in state (format_report_node may have set it).
         if not state.get("budget_summary"):
             state["budget_summary"] = budget.summary()
 
@@ -375,6 +376,114 @@ def evaluate_batch(
 # Summary table
 # ---------------------------------------------------------------------------
 
+def _safe_stdev(values: list[float]) -> float:
+    """Compute sample standard deviation, returning 0.0 for n < 2."""
+    if len(values) < 2:
+        return 0.0
+    from statistics import stdev
+    return stdev(values)
+
+
+def _paired_ttest(a: list[float], b: list[float]) -> dict:
+    """Compute paired t-test between two matched samples.
+
+    Returns dict with mean_diff, t_stat, p_value, cohens_d.
+    Falls back to manual computation if scipy is unavailable.
+    """
+    n = min(len(a), len(b))
+    if n < 2:
+        return {}
+
+    diffs = [a[i] - b[i] for i in range(n)]
+    mean_diff = sum(diffs) / n
+    sd_diff = _safe_stdev(diffs)
+
+    if sd_diff == 0:
+        return {"mean_diff": round(mean_diff, 4), "t_stat": float("inf"),
+                "p_value": 0.0, "cohens_d": float("inf"), "n": n}
+
+    t_stat = mean_diff / (sd_diff / (n ** 0.5))
+
+    # Try scipy for proper p-value, fall back to approximation.
+    try:
+        from scipy.stats import t as t_dist
+        p_value = 2 * (1 - t_dist.cdf(abs(t_stat), df=n - 1))
+    except ImportError:
+        # Rough two-tailed p-value approximation using normal distribution.
+        import math
+        z = abs(t_stat)
+        p_value = 2 * (1 - 0.5 * (1 + math.erf(z / math.sqrt(2))))
+
+    # Cohen's d: mean_diff / pooled SD of the two samples.
+    sd_a = _safe_stdev(a[:n])
+    sd_b = _safe_stdev(b[:n])
+    pooled_sd = ((sd_a ** 2 + sd_b ** 2) / 2) ** 0.5
+    cohens_d = mean_diff / pooled_sd if pooled_sd > 0 else 0.0
+
+    return {
+        "mean_diff": round(mean_diff, 4),
+        "t_stat": round(t_stat, 4),
+        "p_value": round(p_value, 4),
+        "cohens_d": round(cohens_d, 4),
+        "n": n,
+    }
+
+
+def _compute_stat_tests(
+    condition_metrics: dict[str, list[dict]],
+) -> list[str]:
+    """Compute paired statistical tests between conditions."""
+    lines = ["", "--- Statistical Tests ---"]
+
+    comparisons = [
+        ("pipeline", "agent-web", "Pipeline vs Agent+Web"),
+        ("pipeline", "pipeline-web", "Pipeline vs Pipeline+Web"),
+        ("agent", "agent-web", "Agent vs Agent+Web"),
+    ]
+    test_metrics = [
+        ("precision", "Precision"),
+        ("edge_evidence_rate", "Edge Evidence Rate"),
+        ("f1", "F1 Score"),
+        ("calibration_gap", "Calibration Gap"),
+    ]
+
+    any_tests = False
+    for mode_a, mode_b, label in comparisons:
+        vals_a_all = condition_metrics.get(mode_a, [])
+        vals_b_all = condition_metrics.get(mode_b, [])
+        if not vals_a_all or not vals_b_all:
+            continue
+
+        for metric_key, metric_label in test_metrics:
+            a = [m.get(metric_key) for m in vals_a_all if metric_key in m]
+            b = [m.get(metric_key) for m in vals_b_all if metric_key in m]
+            a = [x for x in a if x is not None]
+            b = [x for x in b if x is not None]
+
+            if len(a) < 2 or len(b) < 2:
+                continue
+
+            result = _paired_ttest(a, b)
+            if not result:
+                continue
+
+            any_tests = True
+            sig = "*" if result["p_value"] < 0.05 else ""
+            lines.append(
+                f"  {label} ({metric_label}): "
+                f"diff={result['mean_diff']:+.4f}, "
+                f"t={result['t_stat']:.2f}, "
+                f"p={result['p_value']:.3f}{sig}, "
+                f"d={result['cohens_d']:.2f} "
+                f"(n={result['n']})"
+            )
+
+    if not any_tests:
+        lines.append("  Insufficient data for statistical tests (need >= 2 companies).")
+
+    return lines
+
+
 def format_eval_summary(results: list[dict]) -> str:
     """Format a comparison table from evaluation results."""
     lines = ["=" * 80, "EVALUATION SUMMARY", "=" * 80, ""]
@@ -394,7 +503,7 @@ def format_eval_summary(results: list[dict]) -> str:
     lines.append(header)
     lines.append("-" * len(header))
 
-    # Metric rows.
+    # Metric rows with mean +/- std.
     metric_keys = [
         ("precision", "Precision"),
         ("recall", "Recall"),
@@ -415,10 +524,17 @@ def format_eval_summary(results: list[dict]) -> str:
             nums = [m.get(key, 0) for m in vals if key in m]
             if nums:
                 avg = sum(nums) / len(nums)
+                sd = _safe_stdev(nums)
                 if isinstance(nums[0], float):
-                    row += f"  {avg:>14.4f}"
+                    if sd > 0:
+                        row += f"  {avg:>7.4f}+/-{sd:.2f}"
+                    else:
+                        row += f"  {avg:>14.4f}"
                 else:
-                    row += f"  {avg:>14.1f}"
+                    if sd > 0:
+                        row += f"  {avg:>7.1f}+/-{sd:.1f}"
+                    else:
+                        row += f"  {avg:>14.1f}"
             else:
                 row += f"  {'N/A':>14}"
         lines.append(row)
@@ -431,6 +547,10 @@ def format_eval_summary(results: list[dict]) -> str:
         if m.get("has_ground_truth")
     )
     lines.append(f"With ground truth: {gt_count}")
+
+    # Statistical significance tests.
+    lines += _compute_stat_tests(condition_metrics)
+
     lines.append("")
 
     return "\n".join(lines)
