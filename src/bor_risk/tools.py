@@ -1074,3 +1074,490 @@ def verify_suppliers_batch(
             updated[supplier_name].setdefault("evidence_source", "llm_only")
 
     return list(updated.values()), evidence_items
+
+
+# ---------------------------------------------------------------------------
+# VCG: URL content fetching
+# ---------------------------------------------------------------------------
+
+
+def fetch_url_content(url: str) -> tuple[str, str, str, str, int]:
+    """Download URL and return (plain_text, sha256_hex, mime_type, final_url, http_status).
+
+    Uses ``_urlopen_with_ssl_fallback()``.  Strips HTML tags and extracts the
+    page ``<title>``.  Limits output to 50 000 characters.
+
+    Returns ``("", "", "", url, 0)`` on any error.
+    """
+    from html.parser import HTMLParser
+
+    class _TextExtractor(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.texts: list[str] = []
+            self.title: str = ""
+            self._in_title = False
+            self._skip = False
+
+        def handle_starttag(self, tag: str, attrs: list) -> None:  # type: ignore[override]
+            if tag in ("script", "style", "noscript"):
+                self._skip = True
+            elif tag == "title":
+                self._in_title = True
+
+        def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+            if tag in ("script", "style", "noscript"):
+                self._skip = False
+            elif tag == "title":
+                self._in_title = False
+
+        def handle_data(self, data: str) -> None:  # type: ignore[override]
+            stripped = data.strip()
+            if not stripped:
+                return
+            if self._in_title:
+                self.title += stripped
+            elif not self._skip:
+                self.texts.append(stripped)
+
+    try:
+        raw_bytes = _urlopen_with_ssl_fallback(url, timeout=15)
+    except Exception:
+        return "", "", "", url, 0
+
+    content_hash = hashlib.sha256(raw_bytes).hexdigest()
+    mime_type = "application/pdf" if url.lower().endswith(".pdf") else "text/html"
+
+    try:
+        if mime_type == "application/pdf":
+            plain_text = raw_bytes.decode("utf-8", errors="replace")[:50_000]
+            title = ""
+        else:
+            html_text = raw_bytes.decode("utf-8", errors="replace")
+            parser = _TextExtractor()
+            parser.feed(html_text)
+            plain_text = " ".join(parser.texts)[:50_000]
+            title = parser.title.strip()
+    except Exception:
+        plain_text = ""
+        title = ""
+
+    return plain_text, content_hash, mime_type, url, 200
+
+
+# ---------------------------------------------------------------------------
+# VCG: LLM-based mention extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_mentions_from_doc_llm(
+    doc_text: str,
+    company: str,
+    evidence_id: str,
+) -> list[dict]:
+    """Extract supplier mentions from *doc_text* using a structured LLM call.
+
+    Returns a list of dicts with keys:
+    ``{object_entity_id, supporting_quote, evidence_id, start_char, end_char}``
+
+    Post-verifies each span: if ``start_char:end_char`` does not match
+    ``supporting_quote`` in ``doc_text``, the offsets are cleared to ``None``.
+
+    Returns ``[]`` on any LLM failure.
+    """
+    from bor_risk.models import ClaimExtractionResponse
+
+    if not doc_text.strip():
+        return []
+
+    prompts = load_prompts()
+    template = prompts.get("claim_extraction_prompt", "")
+    if not template:
+        return []
+
+    # Truncate document to stay within context limits.
+    truncated = doc_text[:8_000]
+    prompt_text = template.format(
+        company=company,
+        evidence_id=evidence_id,
+        doc_text=truncated,
+    )
+
+    try:
+        llm = ChatOpenAI(model="gpt-4o", temperature=0, timeout=60, max_retries=2)
+        structured_llm = llm.with_structured_output(ClaimExtractionResponse)
+        response: ClaimExtractionResponse = structured_llm.invoke(
+            [HumanMessage(content=prompt_text)]
+        )
+        mentions = response.mentions_found
+    except Exception:
+        return []
+
+    # Post-verify char offsets: check quote is a substring at the claimed offset.
+    verified: list[dict] = []
+    for m in mentions:
+        quote = m.get("supporting_quote", "")
+        start = m.get("start_char")
+        end = m.get("end_char")
+
+        if quote and start is not None and end is not None:
+            # Verify the span matches the quote
+            span_text = doc_text[start:end] if 0 <= start < end <= len(doc_text) else ""
+            if span_text != quote:
+                # Offsets are wrong; clear them but keep quote if it is in text
+                m = dict(m)
+                m["start_char"] = None
+                m["end_char"] = None
+                if quote not in doc_text:
+                    m["supporting_quote"] = ""
+
+        m = dict(m)
+        m["evidence_id"] = evidence_id  # ensure correct evidence_id
+        verified.append(m)
+
+    return verified
+
+
+# ---------------------------------------------------------------------------
+# VCG: Mention-to-claim linking
+# ---------------------------------------------------------------------------
+
+
+def _normalize_for_link(name: str) -> str:
+    """Lowercase + strip punctuation for linking comparison."""
+    import re
+    return re.sub(r"[.,\-'\"()]", "", name.strip().lower())
+
+
+def link_mentions_to_claims(
+    mentions: list[dict],
+    claims: list["Claim"],  # noqa: F821
+) -> list["Claim"]:  # noqa: F821
+    """Attach evidence spans to PROPOSED claims by fuzzy name matching.
+
+    Matching priority:
+    1. Exact ``normalized_name`` match
+    2. Any alias match
+    3. Fuzzy match via ``rapidfuzz`` (token_set_ratio >= 85) if available,
+       otherwise substring match fallback
+
+    Creates a new PROPOSED Claim only when no existing claim matches AND
+    the mention's evidence word_count context is non-trivial (quote length > 20).
+
+    Returns the updated claims list.
+    """
+    from bor_risk.models import Claim, EvidenceSpan, LocationCandidate
+
+    try:
+        from rapidfuzz.fuzz import token_set_ratio as _tsr
+        def _fuzzy_match(a: str, b: str) -> bool:
+            return _tsr(a, b) >= 85
+    except ImportError:
+        def _fuzzy_match(a: str, b: str) -> bool:  # type: ignore[misc]
+            return a in b or b in a
+
+    updated = [c.model_copy(deep=True) for c in claims]
+    claim_index = {i: updated[i].normalized_name for i in range(len(updated))}
+
+    for mention in mentions:
+        obj = mention.get("object_entity_id", "")
+        if not obj:
+            continue
+        quote = mention.get("supporting_quote", "")
+        eid = mention.get("evidence_id", "")
+        start_char = mention.get("start_char")
+        end_char = mention.get("end_char")
+        norm_obj = _normalize_for_link(obj)
+
+        # Find matching claim
+        best_idx: int | None = None
+        for i, claim in enumerate(updated):
+            if claim.normalized_name == norm_obj:
+                best_idx = i
+                break
+            if any(_normalize_for_link(a) == norm_obj for a in claim.aliases):
+                best_idx = i
+                break
+            if _fuzzy_match(claim.normalized_name, norm_obj):
+                best_idx = i
+                # Don't break — prefer exact match
+
+        if best_idx is not None:
+            c = updated[best_idx]
+            if eid and eid not in c.evidence_refs:
+                c.evidence_refs.append(eid)
+            if quote and eid:
+                span = EvidenceSpan(
+                    evidence_id=eid,
+                    start_char=start_char,
+                    end_char=end_char,
+                    quote=quote,
+                )
+                c.supporting_spans.append(span)
+            if c.status == "PROPOSED":
+                c = c.model_copy(update={"status": "RETRIEVED"})
+                updated[best_idx] = c
+        else:
+            # Create new PROPOSED claim only for substantial quotes
+            if quote and len(quote) > 20:
+                from bor_risk.models import Claim as _Claim
+                import hashlib as _hs
+                new_norm = _normalize_for_link(obj)
+                cid = _hs.sha256(
+                    f"{mention.get('company', '')}|{obj}|SUPPLIES_TO|1".encode()
+                ).hexdigest()[:12]
+                display_id = f"C{len(updated) + 1:03d}"
+                span = EvidenceSpan(
+                    evidence_id=eid,
+                    start_char=start_char,
+                    end_char=end_char,
+                    quote=quote,
+                )
+                new_claim = _Claim(
+                    claim_id=cid,
+                    display_id=display_id,
+                    subject_entity_id=mention.get("company", ""),
+                    object_entity_id=obj,
+                    normalized_name=new_norm,
+                    confidence=0.3,  # low initial confidence for evidence-only claims
+                    evidence_refs=[eid] if eid else [],
+                    supporting_spans=[span],
+                    status="RETRIEVED",
+                )
+                updated.append(new_claim)
+
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# VCG: Two-stage claim verification
+# ---------------------------------------------------------------------------
+
+
+def verify_claim_against_evidence(
+    claim: "Claim",  # noqa: F821
+    evidence_text: str,
+    budget: "BudgetTracker | None" = None,  # noqa: F821
+) -> "VerificationVerdict":  # noqa: F821
+    """Verify a Claim against evidence text using two-stage verification.
+
+    Stage 1 — heuristic pre-filter (no LLM cost):
+      - co-mention check: both company and supplier names present
+      - relationship-cue check: ``_RELATIONSHIP_CUES`` near both names
+      - negation check: termination/dispute language → DISPUTED
+
+    Stage 2 — LLM entailment verdict (structured output):
+      - Uses ``claim_verification_prompt`` from ``prompts.yaml``
+      - Returns :class:`VerificationVerdict` with verdict, rationale, quote, direction
+
+    Stage 3 — Substring guard (always runs after Stage 2):
+      - If ``supporting_quote`` is not an exact substring of ``evidence_text``,
+        downgrades SUPPORTED → WEAK and clears the quote.
+
+    Returns :class:`VerificationVerdict`.
+    """
+    from bor_risk.models import VerificationVerdict
+
+    company = claim.subject_entity_id
+    supplier = claim.object_entity_id
+    text_lower = evidence_text.lower()
+    company_lower = company.lower()
+    supplier_lower = supplier.lower()
+
+    # --- Stage 1: heuristic pre-filter ---
+
+    has_co_mention = company_lower in text_lower and supplier_lower in text_lower
+    if not has_co_mention:
+        return VerificationVerdict(
+            verdict="UNKNOWN",
+            rationale="Co-mention check failed: neither company nor supplier found in evidence.",
+            supporting_quote="",
+            direction="unclear",
+        )
+
+    _NEGATION_CUES = frozenset({
+        "no longer", "terminated", "dispute", "divest", "ended supply",
+        "removed from", "cut ties", "dissolved", "bankruptcy", "ceased",
+        "dropped", "parted ways",
+    })
+    has_negation = any(cue in text_lower for cue in _NEGATION_CUES)
+    if has_negation:
+        return VerificationVerdict(
+            verdict="DISPUTED",
+            rationale="Evidence contains termination or dispute language.",
+            supporting_quote="",
+            direction="unclear",
+        )
+
+    has_relationship = any(cue in text_lower for cue in _RELATIONSHIP_CUES)
+
+    # --- Stage 2: LLM entailment ---
+    prompts = load_prompts()
+    template = prompts.get("claim_verification_prompt", "")
+
+    if not template:
+        # No prompt configured — fall back to heuristic
+        verdict = "SUPPORTED" if has_relationship else "WEAK"
+        return VerificationVerdict(
+            verdict=verdict,
+            rationale="Heuristic verification only (no LLM prompt configured).",
+            supporting_quote="",
+            direction="unclear",
+        )
+
+    if budget is not None and budget.llm_budget_remaining <= 0:
+        verdict = "SUPPORTED" if has_relationship else "WEAK"
+        return VerificationVerdict(
+            verdict=verdict,
+            rationale="LLM budget exhausted; heuristic fallback used.",
+            supporting_quote="",
+            direction="unclear",
+        )
+
+    # Build a focused snippet centred on the supplier mention.
+    idx = text_lower.find(supplier_lower)
+    if idx >= 0:
+        start = max(0, idx - 200)
+        end = min(len(evidence_text), idx + 400)
+        snippet = evidence_text[start:end]
+    else:
+        snippet = evidence_text[:600]
+
+    try:
+        llm = ChatOpenAI(model="gpt-4o", temperature=0, timeout=60, max_retries=2)
+        structured_llm = llm.with_structured_output(VerificationVerdict)
+        prompt_text = template.format(
+            company=company,
+            supplier=supplier,
+            evidence_snippet=snippet[:2_000],
+        )
+        result: VerificationVerdict = structured_llm.invoke(
+            [HumanMessage(content=prompt_text)]
+        )
+        if budget is not None:
+            budget.record_llm_call(purpose=f"verify_claim_{claim.claim_id}")
+    except Exception:
+        verdict = "SUPPORTED" if has_relationship else "WEAK"
+        return VerificationVerdict(
+            verdict=verdict,
+            rationale="LLM verification failed; heuristic fallback used.",
+            supporting_quote="",
+            direction="unclear",
+        )
+
+    # --- Stage 3: substring guard ---
+    quote = result.supporting_quote
+    if quote and quote not in evidence_text:
+        # Quote is not verbatim in evidence — downgrade
+        if result.verdict == "SUPPORTED":
+            result = VerificationVerdict(
+                verdict="WEAK",
+                rationale=result.rationale + " [Quote not verified as exact substring]",
+                supporting_quote="",
+                direction=result.direction,
+            )
+        else:
+            result = VerificationVerdict(
+                verdict=result.verdict,
+                rationale=result.rationale,
+                supporting_quote="",
+                direction=result.direction,
+            )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# VCG: Location resolution
+# ---------------------------------------------------------------------------
+
+# Simple lookup table for common location phrases → lat/lon
+_CITY_COORDS: dict[str, tuple[float, float]] = {
+    "shenzhen": (22.543, 114.057),
+    "taipei": (25.033, 121.565),
+    "shanghai": (31.228, 121.474),
+    "beijing": (39.905, 116.391),
+    "tokyo": (35.689, 139.692),
+    "osaka": (34.693, 135.502),
+    "seoul": (37.566, 126.978),
+    "munich": (48.137, 11.576),
+    "berlin": (52.520, 13.405),
+    "frankfurt": (50.110, 8.682),
+    "london": (51.508, -0.128),
+    "paris": (48.857, 2.347),
+    "amsterdam": (52.370, 4.895),
+    "san jose": (37.338, -121.886),
+    "san francisco": (37.774, -122.419),
+    "austin": (30.267, -97.743),
+    "new york": (40.713, -74.006),
+    "singapore": (1.352, 103.820),
+    "hong kong": (22.319, 114.170),
+    "bangalore": (12.972, 77.594),
+    "chennai": (13.082, 80.270),
+    "pune": (18.520, 73.856),
+    "hsinchu": (24.813, 120.967),
+    "eindhoven": (51.441, 5.479),
+    "stockholm": (59.333, 18.065),
+}
+
+
+def _geocode_simple(place_name: str) -> tuple[float, float] | None:
+    """Return (lat, lon) for well-known city names using a lookup table."""
+    key = place_name.lower().strip()
+    for city, coords in _CITY_COORDS.items():
+        if city in key:
+            return coords
+    return None
+
+
+def resolve_locations_for_claims(
+    claims: list["Claim"],  # noqa: F821
+    evidence_texts: dict[str, str],
+    company: str = "",
+    budget: "BudgetTracker | None" = None,  # noqa: F821
+) -> list["Claim"]:
+    """Enrich ``location_candidates`` for each claim from evidence snippets.
+
+    For each claim, scans associated evidence texts for city/country mentions
+    using a simple geocode lookup table.  When a location is found with higher
+    confidence than the existing LLM seed, it is prepended to
+    ``location_candidates``.
+
+    Falls back to the existing LLM seed (source="llm") if no evidence-based
+    location is found.
+    """
+    from bor_risk.models import LocationCandidate
+
+    updated = [c.model_copy(deep=True) for c in claims]
+
+    for i, claim in enumerate(updated):
+        found_loc: LocationCandidate | None = None
+
+        for eid in claim.evidence_refs:
+            ev_text = evidence_texts.get(eid, "")
+            if not ev_text:
+                continue
+
+            # Look for city names in the evidence text
+            ev_lower = ev_text.lower()
+            for city, coords in _CITY_COORDS.items():
+                if city in ev_lower:
+                    found_loc = LocationCandidate(
+                        lat=coords[0],
+                        lon=coords[1],
+                        confidence=0.75,
+                        source="evidence",
+                        place_name=city.title(),
+                    )
+                    break
+            if found_loc:
+                break
+
+        if found_loc:
+            # Prepend evidence-based candidate (higher confidence than LLM seed)
+            new_candidates = [found_loc] + [
+                c for c in claim.location_candidates if c.source != "evidence"
+            ]
+            updated[i] = claim.model_copy(update={"location_candidates": new_candidates})
+
+    return updated

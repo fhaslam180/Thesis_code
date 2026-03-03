@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
-from bor_risk.graph import run_graph
+from bor_risk.graph import run_vcg_graph as run_graph
 from bor_risk.sensitivity import (
     build_default_scenarios,
     format_sensitivity_report,
@@ -167,14 +165,14 @@ class TestCLISensitivity:
         from bor_risk.cli import main
 
         out_path = tmp_output_dir / "acme.txt"
-        with patch("bor_risk.cli.run_graph", side_effect=run_graph):
-            main([
-                "--company", "ACME",
-                "--tier-depth", "2",
-                "--out", str(out_path),
-                "--no-llm",
-                "--sensitivity",
-            ])
+        main([
+            "--company", "ACME",
+            "--tier-depth", "2",
+            "--out", str(out_path),
+            "--no-llm",
+            "--no-web",
+            "--sensitivity",
+        ])
 
         sensitivity_file = tmp_output_dir / "acme_sensitivity.json"
         assert sensitivity_file.exists()

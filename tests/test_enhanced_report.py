@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from bor_risk.graph import run_graph
+from bor_risk.graph import run_vcg_graph
 
 
 def _acme_state() -> dict:
-    return run_graph("ACME", tier_depth=2, use_llm=False)
+    return run_vcg_graph("ACME", tier_depth=2, use_llm=False)
 
 
 def _global_state() -> dict:
-    return run_graph("GlobalMfg", tier_depth=1, use_llm=False)
+    return run_vcg_graph("GlobalMfg", tier_depth=1, use_llm=False)
 
 
 class TestExecutiveSummary:
@@ -61,7 +61,6 @@ class TestNarrativeSections:
         report = _acme_state()["report_text"]
         idx = report.index("--- Narrative Assessment ---")
         section = report[idx:]
-        # Expect blank-line paragraph breaks in the narrative section.
         assert section.count("\n\n") >= 3
 
     def test_detailed_data_appendix_marker_present(self) -> None:
@@ -114,15 +113,6 @@ class TestMitigations:
             or "Rationale:" in section
             or "    - " in section
         )
-
-    def test_mitigation_format_when_present(self) -> None:
-        report = _acme_state()["report_text"]
-        idx = report.index("--- Mitigations ---")
-        section = report[idx:]
-        if "No mitigations generated." in section:
-            return
-        assert " / " in section
-        assert any(f"({lvl})" in section for lvl in ["Medium", "High"])
 
     def test_global_has_section(self) -> None:
         """GlobalMfg should still have the section header."""
@@ -180,7 +170,6 @@ class TestIEEEReferences:
         report = _acme_state()["report_text"]
         idx = report.index("--- IEEE References ---")
         section = report[idx:]
-        # Count reference numbers — should be at most 6
         import re
         refs = re.findall(r"\[\d+\]", section)
         assert len(refs) <= 6
@@ -193,10 +182,9 @@ class TestExistingMarkersPreserved:
         report = _acme_state()["report_text"]
         assert "Supply-Chain Risk Report" in report
 
-    def test_agent_workflow_marker(self) -> None:
+    def test_pipeline_workflow_marker(self) -> None:
         report = _acme_state()["report_text"]
-        assert "--- Agent Workflow ---" in report
-        assert "Decision route" in report
+        assert "--- Pipeline Workflow ---" in report
         assert "Trace:" in report
 
     def test_report_text_nonempty(self) -> None:

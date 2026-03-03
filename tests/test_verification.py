@@ -1,9 +1,15 @@
-"""Tests for pipeline web verification (Condition B) and evidence-source weighting."""
+"""Tests for claim verification and evidence-source weighting."""
 
 from unittest.mock import patch
 
 from bor_risk.budget import BudgetTracker
-from bor_risk.tools import compute_risk_summary, verify_suppliers_batch
+from bor_risk.models import Claim
+from bor_risk.tools import compute_risk_summary, verify_claim_against_evidence, verify_suppliers_batch
+
+
+# ---------------------------------------------------------------------------
+# Existing pipeline verification tests (Condition B)
+# ---------------------------------------------------------------------------
 
 
 class TestVerifySuppliersBatch:
@@ -125,8 +131,6 @@ class TestEvidenceSourceWeighting:
         )
 
         risks = {r["supplier_name"]: r for r in summary["supplier_risks"]}
-        # Same base score but Unverified should have lower risk_score
-        # due to halved effective confidence.
         assert risks["Verified"]["risk_score"] > risks["Unverified"]["risk_score"]
 
     def test_fixture_sources_not_penalised(self):
@@ -151,3 +155,133 @@ class TestEvidenceSourceWeighting:
         # With evidence_source="fixture", confidence_factor = 0.5 + 0.5*0.8 = 0.9
         expected = round(0.5 * 0.9, 4)
         assert risk["risk_score"] == expected
+
+
+# ---------------------------------------------------------------------------
+# New: verify_claim_against_evidence unit tests
+# ---------------------------------------------------------------------------
+
+
+def _make_claim(company: str, supplier: str, tier: int = 1) -> Claim:
+    import hashlib
+    cid = hashlib.sha256(
+        f"{company}|{supplier}|SUPPLIES_TO|{tier}".encode()
+    ).hexdigest()[:12]
+    return Claim(
+        claim_id=cid,
+        display_id="C001",
+        subject_entity_id=company,
+        object_entity_id=supplier,
+        normalized_name=supplier.lower(),
+        confidence=0.8,
+    )
+
+
+class TestVerifyClaimAgainstEvidence:
+    """Unit tests for verify_claim_against_evidence (heuristic path)."""
+
+    def test_co_mention_missing_returns_unknown(self):
+        """Company not in evidence text → UNKNOWN verdict."""
+        claim = _make_claim("Apple", "TSMC")
+        # Text mentions TSMC but not Apple.
+        evidence = "TSMC is a major semiconductor manufacturer based in Taiwan."
+        budget = BudgetTracker(max_llm_calls=0)  # exhausted: heuristic path
+
+        result = verify_claim_against_evidence(claim, evidence, budget)
+        assert result.verdict == "UNKNOWN"
+
+    def test_supplier_missing_returns_unknown(self):
+        """Supplier not in evidence text → UNKNOWN verdict."""
+        claim = _make_claim("Apple", "TSMC")
+        # Text mentions Apple but not TSMC.
+        evidence = "Apple is a major technology company headquartered in Cupertino."
+        budget = BudgetTracker(max_llm_calls=0)
+
+        result = verify_claim_against_evidence(claim, evidence, budget)
+        assert result.verdict == "UNKNOWN"
+
+    def test_negation_returns_disputed(self):
+        """Termination/dispute language → DISPUTED verdict."""
+        claim = _make_claim("Apple", "TSMC")
+        evidence = (
+            "Apple has no longer relied on TSMC as a supplier and "
+            "has terminated the relationship."
+        )
+        budget = BudgetTracker(max_llm_calls=0)
+
+        result = verify_claim_against_evidence(claim, evidence, budget)
+        assert result.verdict == "DISPUTED"
+
+    def test_relationship_cue_with_exhausted_budget(self):
+        """Co-mention + relationship cue + no LLM budget → SUPPORTED (heuristic)."""
+        claim = _make_claim("Apple", "TSMC")
+        # Contains co-mention AND a relationship cue word ("supplier")
+        evidence = "Apple uses TSMC as a key supplier for A-series chips."
+        budget = BudgetTracker(max_llm_calls=0)  # budget exhausted
+
+        result = verify_claim_against_evidence(claim, evidence, budget)
+        assert result.verdict == "SUPPORTED"
+
+    def test_no_relationship_cue_with_exhausted_budget(self):
+        """Co-mention without relationship cue + no LLM budget → WEAK (heuristic)."""
+        claim = _make_claim("Apple", "TSMC")
+        # Contains co-mention but NO relationship cue word
+        evidence = "Both Apple and TSMC are major technology companies."
+        budget = BudgetTracker(max_llm_calls=0)  # budget exhausted
+
+        result = verify_claim_against_evidence(claim, evidence, budget)
+        assert result.verdict == "WEAK"
+
+    def test_substring_guard_with_mocked_llm(self):
+        """Stage 3: LLM returns SUPPORTED with non-verbatim quote → downgrade to WEAK."""
+        from unittest.mock import patch, MagicMock
+        from bor_risk.models import VerificationVerdict
+
+        claim = _make_claim("Apple", "TSMC")
+        evidence = "Apple relies on TSMC as a key supplier for semiconductors."
+        budget = BudgetTracker(max_llm_calls=10)
+
+        # LLM returns SUPPORTED but with a quote NOT in the evidence text
+        fake_verdict = VerificationVerdict(
+            verdict="SUPPORTED",
+            rationale="Apple and TSMC have a supplier relationship.",
+            supporting_quote="TSMC manufactures chips exclusively for Apple",  # NOT verbatim
+            direction="supplier_to_company",
+        )
+
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value.invoke.return_value = fake_verdict
+
+        with patch("bor_risk.tools.ChatOpenAI", return_value=mock_llm):
+            result = verify_claim_against_evidence(claim, evidence, budget)
+
+        # Quote not in evidence → SUPPORTED downgraded to WEAK
+        assert result.verdict == "WEAK"
+        assert result.supporting_quote == ""
+
+    def test_substring_guard_keeps_valid_quote(self):
+        """Stage 3: LLM returns SUPPORTED with verbatim quote → stays SUPPORTED."""
+        from unittest.mock import patch, MagicMock
+        from bor_risk.models import VerificationVerdict
+
+        claim = _make_claim("Apple", "TSMC")
+        evidence = "Apple relies on TSMC as a key supplier for semiconductors."
+        budget = BudgetTracker(max_llm_calls=10)
+
+        # LLM returns SUPPORTED with a quote that IS verbatim in the evidence
+        verbatim_quote = "TSMC as a key supplier"
+        fake_verdict = VerificationVerdict(
+            verdict="SUPPORTED",
+            rationale="TSMC is Apple's supplier.",
+            supporting_quote=verbatim_quote,
+            direction="supplier_to_company",
+        )
+
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value.invoke.return_value = fake_verdict
+
+        with patch("bor_risk.tools.ChatOpenAI", return_value=mock_llm):
+            result = verify_claim_against_evidence(claim, evidence, budget)
+
+        assert result.verdict == "SUPPORTED"
+        assert result.supporting_quote == verbatim_quote

@@ -400,23 +400,52 @@ def _build_budget_summary(state: GraphState) -> list[str]:
     return lines
 
 
-def _build_agent_trace_section(state: GraphState) -> list[str]:
-    """Agent trace section (only for agent modes)."""
-    agent_trace = state.get("agent_trace", [])
-    if not agent_trace:
+def _build_claim_summary(state: GraphState) -> list[str]:
+    """Verified Claim Graph summary: verdict breakdown + supporting quotes."""
+    claims = state.get("claims", [])
+    if not claims:
         return []
 
-    lines = ["", "--- Agent Trace ---"]
-    for i, step in enumerate(agent_trace, 1):
-        tool = step.get("tool", "unknown")
-        args = step.get("args", "")
-        result_summary = step.get("result_summary", "")
-        line = f"  {i}. {tool}"
-        if args:
-            line += f"({args})"
-        if result_summary:
-            line += f" -> {result_summary}"
+    total = len(claims)
+    verdict_counts: dict[str, int] = {}
+    for c in claims:
+        v = c.get("verdict", "UNKNOWN")
+        verdict_counts[v] = verdict_counts.get(v, 0) + 1
+
+    lines = ["", "--- Claim Summary (Verified Claim Graph) ---"]
+    lines.append(f"  Total claims: {total}")
+    for verdict in ("SUPPORTED", "WEAK", "DISPUTED", "UNKNOWN"):
+        count = verdict_counts.get(verdict, 0)
+        pct = 100 * count / total if total > 0 else 0.0
+        lines.append(f"  {verdict}: {count} ({pct:.0f}%)")
+
+    strict_mode = state.get("strict_mode", False)
+    shown = 0
+    for c in claims:
+        verdict = c.get("verdict", "UNKNOWN")
+        if strict_mode and verdict not in ("SUPPORTED", "WEAK"):
+            continue
+        if verdict not in ("SUPPORTED", "WEAK"):
+            continue
+        spans = c.get("supporting_spans", [])
+        quote = spans[0].get("quote", "") if spans else ""
+        display = c.get("display_id", "?")
+        obj = c.get("object_entity_id", "?")
+        direction = ""
+        expl = c.get("verdict_explanation", "")
+        if "direction=" in expl:
+            direction = expl.split("direction=")[-1].rstrip("]")
+        line = f"  [{display}] {obj}: {verdict}"
+        if direction and direction != "unclear":
+            line += f" ({direction})"
+        if quote:
+            short_quote = quote[:150] + ("..." if len(quote) > 150 else "")
+            line += f'\n    "{short_quote}"'
         lines.append(line)
+        shown += 1
+        if shown >= 10:
+            break
+
     return lines
 
 
@@ -487,10 +516,13 @@ def format_report(state: GraphState) -> str:
     # Evidence Source Summary
     lines += _build_evidence_source_summary(suppliers)
 
-    # Agent Workflow (unchanged markers)
+    # Claim Summary (VCG)
+    lines += _build_claim_summary(state)
+
+    # Pipeline Workflow
     lines += [
         "",
-        "--- Agent Workflow ---",
+        "--- Pipeline Workflow ---",
     ]
 
     if trace:
@@ -591,10 +623,7 @@ def format_report(state: GraphState) -> str:
     # Budget Summary
     lines += _build_budget_summary(state)
 
-    # Agent Trace (agent modes only)
-    lines += _build_agent_trace_section(state)
-
-    # IEEE References (enhanced)
+    # IEEE References
     lines += _build_ieee_references(hazards)
 
     lines.append("")

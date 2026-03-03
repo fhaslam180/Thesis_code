@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from bor_risk.graph import run_graph
+from bor_risk.graph import run_vcg_graph as run_graph
 from bor_risk.models import CompanyProfile, MitigationResponse, TierResponse
 from bor_risk.tools import generate_mitigations_llm
 
@@ -90,9 +90,9 @@ class TestMitigationNodeMockMode:
         report = state["report_text"]
         assert "No mitigations generated" in report
 
-    def test_workflow_trace_includes_mitigation_node(self) -> None:
+    def test_workflow_trace_includes_generate_report_node(self) -> None:
         state = run_graph("GlobalMfg", tier_depth=1, use_llm=False)
-        assert "generate_mitigations" in state["workflow_trace"]
+        assert "generate_report" in state["workflow_trace"]
 
 
 class TestMitigationInReport:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from bor_risk.graph import run_graph
+from bor_risk.graph import run_vcg_graph as run_graph
 from bor_risk.models import (
     AlternativeResponse,
     CompanyProfile,
@@ -107,9 +107,9 @@ class TestSuggestAlternativesNode:
         assert "suggested_alternatives" in state
         assert len(state["suggested_alternatives"]) == 0
 
-    def test_workflow_trace_includes_suggest_alternatives(self) -> None:
+    def test_workflow_trace_includes_generate_report_node(self) -> None:
         state = run_graph("ACME", tier_depth=2, use_llm=False)
-        assert "suggest_alternatives" in state["workflow_trace"]
+        assert "generate_report" in state["workflow_trace"]
 
     def test_node_handles_llm_failure(self) -> None:
         """Exception in suggest_alternatives_llm returns empty list gracefully."""

@@ -77,6 +77,66 @@ suggest_alternatives_prompt: |
   Only suggest alternatives for suppliers rated Medium or High risk overall.
   Do NOT suggest alternatives for Low-risk suppliers.
 
+claim_extraction_prompt: |
+  Given the following document text, extract all mentions of supplier or vendor
+  relationships involving the company "{company}".
+
+  For each relationship found, provide:
+  - object_entity_id: The supplier or vendor company name
+  - supporting_quote: Copy the exact verbatim text that mentions the relationship
+  - evidence_id: "{evidence_id}" (use this exact value for all mentions)
+  - start_char: approximate integer character offset where the quote starts in the document
+  - end_char: approximate integer character offset where the quote ends in the document
+
+  Document text:
+  {doc_text}
+
+  Only extract relationships with clear textual evidence. Do not infer or guess.
+  If a company is mentioned as customer/client of the supplier, that also counts.
+  Return extraction_confidence between 0.0 and 1.0.
+
+claim_verification_prompt: |
+  You are verifying a supply chain relationship claim.
+
+  Claim: "{company}" sources from / works with "{supplier}"
+
+  Evidence text:
+  {evidence_snippet}
+
+  Does this evidence SUPPORT, WEAKLY support, DISPUTE, or is INSUFFICIENT
+  to verify the claim?
+
+  Provide:
+  - verdict: One of SUPPORTED, WEAK, DISPUTED, UNKNOWN
+    * SUPPORTED: clear, direct evidence of the supply relationship
+    * WEAK: indirect or ambiguous evidence (e.g. mentioned together without explicit relationship)
+    * DISPUTED: evidence contradicts the claim (termination, dispute, no longer a supplier)
+    * UNKNOWN: insufficient evidence to make a determination
+  - rationale: 1-2 sentences explaining your verdict
+  - supporting_quote: Copy the exact verbatim text from the evidence that most directly
+    supports or contradicts the claim. Must be a verbatim substring of the evidence text.
+    Return empty string if no relevant quote exists.
+  - direction: One of supplier_to_company, company_to_supplier, unclear
+    * supplier_to_company: the text describes the supplier providing to the company
+    * company_to_supplier: the text describes the company sourcing from the supplier
+    * unclear: direction is ambiguous
+
+  IMPORTANT: The supporting_quote must be copied VERBATIM from the evidence text above.
+
+location_extraction_prompt: |
+  Given the following document text about "{company}" and its supplier "{supplier}",
+  extract any mentions of physical locations associated with "{supplier}".
+
+  Look for: city names, country names, facility locations, factory addresses,
+  office locations, warehouse locations.
+
+  Document text:
+  {doc_text}
+
+  Return a JSON list of location strings, e.g. ["Shenzhen, China", "Munich, Germany"].
+  Return an empty list [] if no locations are mentioned.
+  Only include locations clearly associated with "{supplier}", not with other companies.
+
 agent_system_prompt: |
   You are an autonomous supply chain risk analyst. Your task is to assess
   geospatial hazard risk for a company's supplier network.

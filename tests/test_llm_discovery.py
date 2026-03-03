@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from bor_risk.models import CompanyProfile, Supplier, TierResponse
 from bor_risk.tools import _deduplicate_suppliers, discover_suppliers_llm, resolve_company_profile
-from bor_risk.graph import run_graph
+from bor_risk.graph import run_vcg_graph as run_graph
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "llm_responses"
 

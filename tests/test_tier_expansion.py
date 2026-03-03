@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch
-
-from bor_risk.graph import run_graph
+from bor_risk.graph import run_vcg_graph as run_graph
 from bor_risk.cli import main as cli_main
 
 
@@ -34,7 +32,7 @@ class TestRunGraph:
         assert "Supply-Chain Risk Report" in state["report_text"]
 
     def test_different_company(self) -> None:
-        state = run_graph("GlobalMfg", tier_depth=1)
+        state = run_graph("GlobalMfg", tier_depth=1, use_llm=False)
         names = {s["name"] for s in state["suppliers"]}
         assert "PlastiCo" in names
         assert "SteelCorp" not in names
@@ -43,10 +41,10 @@ class TestRunGraph:
         import pytest
 
         with pytest.raises(KeyError, match="NonExistent"):
-            run_graph("NonExistent", tier_depth=2)
+            run_graph("NonExistent", tier_depth=2, use_llm=False)
 
     def test_tier_depth_filters(self) -> None:
-        state = run_graph("ACME", tier_depth=1)
+        state = run_graph("ACME", tier_depth=1, use_llm=False)
         names = {s["name"] for s in state["suppliers"]}
         assert "SteelCorp" in names
         assert "RareMinerals Ltd" not in names
@@ -56,15 +54,15 @@ class TestCLI:
     """CLI integration tests — patched to avoid real LLM calls."""
 
     def _run_cli(self, tmp_output_dir: Path) -> None:
-        """Run CLI with LLM disabled via patch."""
+        """Run CLI with LLM and web disabled via flags."""
         out_flag = str(tmp_output_dir / "acme.txt")
-        with patch("bor_risk.cli.run_graph", wraps=run_graph) as mock_rg:
-            # Intercept to force use_llm=False
-            def _no_llm(company, tier_depth, **kw):
-                return run_graph(company, tier_depth, use_llm=False)
-
-            mock_rg.side_effect = _no_llm
-            cli_main(["--company", "ACME", "--tier-depth", "2", "--out", out_flag])
+        cli_main([
+            "--company", "ACME",
+            "--tier-depth", "2",
+            "--out", out_flag,
+            "--no-llm",
+            "--no-web",
+        ])
 
     def test_creates_output_files(self, tmp_output_dir: Path) -> None:
         self._run_cli(tmp_output_dir)

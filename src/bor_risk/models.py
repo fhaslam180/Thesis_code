@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import operator
 from datetime import datetime
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -173,6 +173,85 @@ class AlternativeResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Verified Claim Graph models
+# ---------------------------------------------------------------------------
+
+
+class EvidenceSpan(BaseModel):
+    """Anchored evidence reference — links a claim to an exact passage in a snapshot."""
+
+    evidence_id: str
+    start_char: int | None = None      # char offset in plain-text snapshot
+    end_char: int | None = None
+    page: int | None = None            # PDF page if known; None for HTML
+    quote: str                         # verbatim substring of snapshot text
+
+
+class EvidencePacket(BaseModel):
+    """A fetched web page stored with content-addressing."""
+
+    evidence_id: str           # SHA-256[:16] of content
+    url: str
+    final_url: str             # URL after redirects
+    domain: str
+    title: str = ""
+    retrieved_at: str          # ISO-8601 UTC
+    http_status: int = 200
+    content_hash: str          # full SHA-256 of raw bytes
+    mime_type: str
+    snapshot_path: str | None = None
+    quality_signals: dict[str, Any] = Field(default_factory=dict)
+    # quality_signals: is_official_domain (bool), is_pdf (bool), word_count (int)
+
+
+class LocationCandidate(BaseModel):
+    """A candidate lat/lon location for a claim's facility."""
+
+    lat: float
+    lon: float
+    confidence: float
+    source: str                # "llm" | "evidence" | "fixture"
+    place_name: str = ""
+
+
+class Claim(BaseModel):
+    """A verifiable supplier relationship claim in the Verified Claim Graph."""
+
+    claim_id: str              # sha256(subject|object|type|tier)[:12] — deterministic
+    display_id: str            # "C001", "C002", ... for human-readable report only
+    subject_entity_id: str    # parent company
+    object_entity_id: str     # supplier name (original form)
+    normalized_name: str      # lowercased, stripped for dedup + fuzzy linking
+    aliases: list[str] = Field(default_factory=list)  # alternate forms for fuzzy match
+    claim_type: Literal["SUPPLIES_TO", "MANUFACTURES_FOR"] = "SUPPLIES_TO"
+    status: Literal["PROPOSED", "RETRIEVED", "VERIFIED"] = "PROPOSED"
+    verdict: Literal["SUPPORTED", "WEAK", "DISPUTED", "UNKNOWN"] = "UNKNOWN"
+    confidence: float
+    evidence_refs: list[str] = Field(default_factory=list)   # evidence_ids
+    supporting_spans: list[EvidenceSpan] = Field(default_factory=list)
+    location_candidates: list[LocationCandidate] = Field(default_factory=list)
+    tier: int = 1
+    rationale: str = ""
+    verdict_explanation: str = ""
+
+
+class VerificationVerdict(BaseModel):
+    """LLM structured output for the second-stage entailment check."""
+
+    verdict: Literal["SUPPORTED", "WEAK", "DISPUTED", "UNKNOWN"]
+    rationale: str             # 1-2 sentences
+    supporting_quote: str      # verbatim text from evidence (machine-verified afterward)
+    direction: Literal["supplier_to_company", "company_to_supplier", "unclear"] = "unclear"
+
+
+class ClaimExtractionResponse(BaseModel):
+    """LLM structured output for extracting supplier mentions from a document."""
+
+    mentions_found: list[dict]   # {object_entity_id, supporting_quote, evidence_id, start_char, end_char}
+    extraction_confidence: float
+
+
+# ---------------------------------------------------------------------------
 # LangGraph state
 # ---------------------------------------------------------------------------
 
@@ -204,7 +283,12 @@ class GraphState(TypedDict, total=False):
     report_text: str
     enable_web: bool
     snapshot_mode: bool
-    agent_trace: list[dict]
     budget_summary: dict
     _max_web_queries: int
     _budget_tracker: object  # BudgetTracker instance, not serialised
+    # VCG fields
+    claims: list[dict]            # list[Claim.model_dump()]
+    evidence_packets: list[dict]  # list[EvidencePacket.model_dump()]
+    mentions: list[dict]          # intermediate: supplier mentions from extraction
+    strict_mode: bool             # Condition D: exclude DISPUTED/UNKNOWN claims
+    no_verify: bool               # Condition B: skip verify_claims_node

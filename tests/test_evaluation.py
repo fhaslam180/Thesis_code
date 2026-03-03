@@ -105,6 +105,8 @@ class TestHardMetrics:
                 {"source": "web:https://example.com"},
                 {"source": "LLM:gpt-4o"},
             ],
+            "claims": [],
+            "evidence_packets": [],
             "budget_summary": {
                 "llm_calls": 3,
                 "web_queries": 5,
@@ -122,17 +124,49 @@ class TestHardMetrics:
         assert metrics["unique_web_sources"] == 1
         assert metrics["unverified_fraction"] > 0  # 1/3 llm_only
 
+    def test_claim_metrics(self):
+        """Claim-level metrics computed from claims list."""
+        state = {
+            "suppliers": [],
+            "edges": [],
+            "hazard_scores": [],
+            "evidence": [],
+            "evidence_packets": [],
+            "claims": [
+                {"verdict": "SUPPORTED", "status": "VERIFIED",
+                 "evidence_refs": ["e1"], "supporting_spans": [{"quote": "hello"}]},
+                {"verdict": "WEAK", "status": "VERIFIED",
+                 "evidence_refs": ["e2"], "supporting_spans": []},
+                {"verdict": "DISPUTED", "status": "VERIFIED",
+                 "evidence_refs": [], "supporting_spans": []},
+                {"verdict": "UNKNOWN", "status": "PROPOSED",
+                 "evidence_refs": [], "supporting_spans": []},
+            ],
+            "budget_summary": {},
+        }
+        metrics = compute_hard_metrics(state)
+        assert metrics["total_claims"] == 4
+        assert metrics["claim_support_rate"] == 0.5   # (1+1)/4
+        assert metrics["dispute_rate"] == 0.25
+        assert metrics["unknown_rate"] == 0.25
+        assert metrics["verified_claim_count"] == 3
+        # quote_valid_rate: 1 supported claim with non-empty quote / 1 total supported = 1.0
+        assert metrics["quote_valid_rate"] == 1.0
+
     def test_empty_state(self):
         state = {
             "suppliers": [],
             "edges": [],
             "hazard_scores": [],
             "evidence": [],
+            "claims": [],
+            "evidence_packets": [],
             "budget_summary": {},
         }
         metrics = compute_hard_metrics(state)
         assert metrics["supplier_count"] == 0
         assert metrics["hazard_coverage"] == 0.0
+        assert metrics["total_claims"] == 0
 
 
 class TestFormatEvalSummary:
@@ -141,17 +175,25 @@ class TestFormatEvalSummary:
             {
                 "company": "TestCo",
                 "conditions": {
-                    "pipeline": {
+                    "llm_only": {
                         "supplier_count": 5,
                         "edge_evidence_rate": 0.0,
                         "hazard_coverage": 1.0,
                         "llm_calls": 3,
                         "web_queries": 0,
+                        "total_claims": 5,
+                        "claim_support_rate": 0.0,
                     },
                 },
             }
         ]
         text = format_eval_summary(results)
         assert "EVALUATION SUMMARY" in text
-        assert "pipeline" in text
+        assert "llm_only" in text
         assert "Companies evaluated: 1" in text
+
+    def test_shows_all_four_conditions_in_header(self):
+        results = []
+        text = format_eval_summary(results)
+        for cond in ["llm_only", "web_retrieve", "web_verify", "strict"]:
+            assert cond in text
