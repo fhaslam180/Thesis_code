@@ -205,6 +205,14 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Export PROV-O JSON-LD provenance file.",
     )
+    parser.add_argument(
+        "--map",
+        action="store_true",
+        help=(
+            "Generate interactive HTML map and static network PNG "
+            "(requires folium, networkx, matplotlib — install with: pip install -e '.[viz]')."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.visualize:
@@ -288,6 +296,12 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Wrote {sensitivity_path}")
 
     _write_outputs(state, out_dir, prefix, export_prov=args.export_prov)
+
+    if args.map:
+        from bor_risk.visualize import render_network_graph, render_supplier_map
+
+        render_supplier_map(state, args.company, out_dir / f"{prefix}_map.html")
+        render_network_graph(state, args.company, out_dir / f"{prefix}_network.png")
 
 
 if __name__ == "__main__":

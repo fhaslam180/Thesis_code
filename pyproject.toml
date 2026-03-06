@@ -19,6 +19,17 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+viz = [
+    "folium>=0.14",
+    "networkx>=3.0",
+    "matplotlib>=3.7",
+]
+all = [
+    "folium>=0.14",
+    "networkx>=3.0",
+    "matplotlib>=3.7",
+    "pytest>=8.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/bor_risk"]
