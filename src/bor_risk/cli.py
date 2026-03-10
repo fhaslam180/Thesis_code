@@ -235,6 +235,14 @@ def main(argv: list[str] | None = None) -> None:
         max_web_queries=args.budget_web,
     )
 
+    import os
+    if enable_web and not os.environ.get("TAVILY_API_KEY"):
+        print(
+            "\n  [ERROR] Web retrieval is enabled but TAVILY_API_KEY is not set.\n"
+            "  Add TAVILY_API_KEY=<key> to your .env file, or pass --no-web.\n"
+        )
+        raise SystemExit(1)
+
     print(f"Analysing supply-chain risk for {args.company}...")
     condition = _detect_condition({
         "enable_web": enable_web,

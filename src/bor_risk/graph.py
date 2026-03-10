@@ -173,6 +173,15 @@ def retrieve_evidence_node(state: GraphState) -> dict:
     if not state.get("enable_web", False):
         return {"workflow_trace": ["retrieve_evidence(skipped)"]}
 
+    import os
+    if not os.environ.get("TAVILY_API_KEY"):
+        print(
+            "\n  [ERROR] TAVILY_API_KEY is not set — web retrieval is disabled.\n"
+            "  Add TAVILY_API_KEY=<key> to your .env file and re-run.\n",
+            flush=True,
+        )
+        return {"workflow_trace": ["retrieve_evidence(no_tavily_key)"]}
+
     try:
         from bor_risk.search import search_web, search_web_snapshot
     except ImportError:
@@ -189,6 +198,7 @@ def retrieve_evidence_node(state: GraphState) -> dict:
 
     now = datetime.now(timezone.utc).isoformat()
     new_packets: list[dict] = []
+    _search_warned = False
 
     for claim in claims:
         if budget and budget.web_budget_remaining <= 0:
@@ -203,7 +213,10 @@ def retrieve_evidence_node(state: GraphState) -> dict:
 
         try:
             results = search_fn(query, max_results=3)
-        except Exception:
+        except Exception as exc:
+            if not _search_warned:
+                print(f"  [WARNING] Web search failed: {exc}", flush=True)
+                _search_warned = True
             continue
 
         for r in results:

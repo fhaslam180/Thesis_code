@@ -247,7 +247,7 @@ class VerificationVerdict(BaseModel):
 class ClaimExtractionResponse(BaseModel):
     """LLM structured output for extracting supplier mentions from a document."""
 
-    mentions_found: list[dict]   # {object_entity_id, supporting_quote, evidence_id, start_char, end_char}
+    mentions_found: list[dict] = Field(default_factory=list)   # {object_entity_id, supporting_quote, evidence_id, start_char, end_char}
     extraction_confidence: float
 
 

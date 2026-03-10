@@ -1185,12 +1185,17 @@ def extract_mentions_from_doc_llm(
 
     try:
         llm = ChatOpenAI(model="gpt-4o", temperature=0, timeout=60, max_retries=2)
-        structured_llm = llm.with_structured_output(ClaimExtractionResponse)
+        # Use function_calling to avoid strict JSON-schema issues with list[dict] fields.
+        structured_llm = llm.with_structured_output(
+            ClaimExtractionResponse, method="function_calling"
+        )
         response: ClaimExtractionResponse = structured_llm.invoke(
             [HumanMessage(content=prompt_text)]
         )
         mentions = response.mentions_found
-    except Exception:
+    except Exception as exc:
+        import sys
+        print(f"  [WARNING] extract_mentions LLM call failed: {exc}", file=sys.stderr, flush=True)
         return []
 
     # Post-verify char offsets: check quote is a substring at the claimed offset.
