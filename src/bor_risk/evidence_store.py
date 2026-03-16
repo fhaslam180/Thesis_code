@@ -78,13 +78,7 @@ class EvidenceStore:
                 snap_file.write_text(content, encoding="utf-8")
             snapshot_path = str(snap_file)
 
-        quality_signals: dict = {
-            "is_official_domain": _is_official_domain(domain),
-            "is_pdf": mime_type == "application/pdf",
-            "word_count": len(content.split()) if content else 0,
-        }
-
-        return EvidencePacket(
+        packet = EvidencePacket(
             evidence_id=evidence_id,
             url=url,
             final_url=final_url,
@@ -95,8 +89,14 @@ class EvidenceStore:
             content_hash=content_hash,
             mime_type=mime_type,
             snapshot_path=snapshot_path,
-            quality_signals=quality_signals,
+            quality_signals={
+                "is_official_domain": _is_official_domain(domain),
+                "is_pdf": mime_type == "application/pdf",
+                "word_count": len(content.split()) if content else 0,
+            },
         )
+        self.update_url_index(url, packet)
+        return packet
 
     def read_snapshot(self, packet: EvidencePacket) -> str | None:
         """Return the stored plain-text snapshot for *packet*, or ``None``."""
@@ -128,3 +128,42 @@ class EvidenceStore:
             self._cache_dir / content_hash[:2] / f"{content_hash}.txt"
         )
         return snap_file.exists()
+
+    # ------------------------------------------------------------------
+    # Persistent URL → packet index (for reproducible snapshot reruns)
+    # ------------------------------------------------------------------
+
+    @property
+    def _url_index_path(self) -> "Path":
+        return self._cache_dir / "packet_index.json"
+
+    def load_url_index(self) -> dict[str, dict]:
+        """Load the persistent URL → packet metadata index from disk.
+
+        Returns a dict mapping URL → ``{"evidence_id": ..., "content_hash": ...}``.
+        Returns an empty dict if the index does not yet exist.
+        """
+        if not self._url_index_path.exists():
+            return {}
+        try:
+            return json.loads(self._url_index_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def update_url_index(self, url: str, packet: EvidencePacket) -> None:
+        """Append or update *url* in the persistent index on disk.
+
+        Safe to call on every :meth:`store` — uses atomic read-modify-write so
+        concurrent runs do not corrupt the index.
+        """
+        index = self.load_url_index()
+        index[url] = {
+            "evidence_id": packet.evidence_id,
+            "content_hash": packet.content_hash,
+            "domain": packet.domain,
+            "retrieved_at": packet.retrieved_at,
+        }
+        self._url_index_path.parent.mkdir(parents=True, exist_ok=True)
+        self._url_index_path.write_text(
+            json.dumps(index, indent=2), encoding="utf-8"
+        )

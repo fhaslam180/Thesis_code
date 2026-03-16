@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
@@ -177,11 +178,23 @@ def compute_hard_metrics(state: dict) -> dict:
         scored_pairs / possible_pairs if possible_pairs > 0 else 0.0
     )
 
-    web_urls = {
-        e.get("source", "").replace("web:", "")
+    def _to_domain(raw: str) -> str:
+        try:
+            return urlparse(raw).netloc or raw
+        except Exception:
+            return raw
+
+    # Collect unique web domains from evidence_packets (VCG pipeline) and
+    # from legacy evidence items (backward compat); normalize all to domain-only.
+    web_domains: set[str] = {
+        p.get("domain", "") for p in evidence_packets if p.get("domain")
+    }
+    web_domains |= {
+        _to_domain(e.get("source", "").replace("web:", ""))
         for e in evidence
         if e.get("source", "").startswith("web:")
     }
+    web_domains.discard("")
 
     llm_only = sum(
         1 for s in suppliers if s.get("evidence_source", "fixture") == "llm_only"
@@ -239,7 +252,7 @@ def compute_hard_metrics(state: dict) -> dict:
         "web_queries": budget.get("web_queries", 0),
         "hazard_score_calls": budget.get("hazard_scores", 0),
         "wall_clock_seconds": budget.get("wall_clock_seconds", 0),
-        "unique_web_sources": len(web_urls),
+        "unique_web_domains": len(web_domains),
         "unverified_fraction": round(unverified_fraction, 4),
         "evidence_count": len(evidence),
         # Claim metrics
@@ -301,6 +314,7 @@ def run_condition(
     tier_depth: int = 2,
     budget: BudgetTracker | None = None,
     snapshot: bool = True,
+    no_llm: bool = False,
 ) -> dict:
     """Run one ablation condition and return the final state.
 
@@ -308,6 +322,10 @@ def run_condition(
     ----------
     condition : str
         One of: "llm_only", "web_retrieve", "web_verify", "strict".
+    no_llm : bool
+        When True, use fixture supplier data instead of LLM discovery.
+        Requires fixture data to exist for *company* in ``data/fixtures/``.
+        Useful for hard-metric benchmarking without LLM API calls.
     """
     if condition not in CONDITIONS:
         raise ValueError(
@@ -321,7 +339,7 @@ def run_condition(
     state = run_vcg_graph(
         company=company,
         tier_depth=tier_depth,
-        use_llm=True,
+        use_llm=not no_llm,
         enable_web=enable_web,
         no_verify=no_verify,
         strict_mode=strict_mode,
@@ -348,6 +366,7 @@ def evaluate_company(
     snapshot: bool = True,
     conditions: list[str] | None = None,
     skip_judge: bool = False,
+    no_llm: bool = False,
 ) -> dict:
     """Run all ablation conditions on one company, compute all metrics."""
     if conditions is None:
@@ -361,7 +380,7 @@ def evaluate_company(
         )
         try:
             state = run_condition(
-                company, condition, tier_depth, budget, snapshot
+                company, condition, tier_depth, budget, snapshot, no_llm=no_llm
             )
             metrics = {
                 **compute_ground_truth_metrics(company, state),
@@ -385,6 +404,7 @@ def evaluate_batch(
     snapshot: bool = True,
     conditions: list[str] | None = None,
     skip_judge: bool = False,
+    no_llm: bool = False,
 ) -> list[dict]:
     """Evaluate multiple companies across all ablation conditions."""
     results = []
@@ -397,6 +417,7 @@ def evaluate_batch(
             snapshot=snapshot,
             conditions=conditions,
             skip_judge=skip_judge,
+            no_llm=no_llm,
         )
         results.append(result)
     return results
@@ -536,6 +557,7 @@ def format_eval_summary(results: list[dict]) -> str:
         ("quote_valid_rate", "Quote Valid Rate"),
         ("mean_evidence_per_claim", "Mean Evidence/Claim"),
         ("unique_domain_per_supported_claim", "Unique Domains/SUPPORTED"),
+        ("unique_web_domains", "Unique Web Domains"),
         ("supplier_count", "Supplier Count"),
         ("llm_calls", "LLM Calls"),
         ("web_queries", "Web Queries"),
@@ -648,6 +670,15 @@ def eval_main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Skip LLM-as-judge scoring.",
     )
+    parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        help=(
+            "Use fixture supplier data instead of LLM discovery. "
+            "Requires fixtures to exist for each company. "
+            "Useful for hard-metric benchmarking without LLM API calls."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.companies:
@@ -682,6 +713,7 @@ def eval_main(argv: list[str] | None = None) -> None:
         snapshot=args.snapshot,
         conditions=selected_conditions,
         skip_judge=args.skip_judge,
+        no_llm=args.no_llm,
     )
 
     results_path = out_dir / "eval_results.json"

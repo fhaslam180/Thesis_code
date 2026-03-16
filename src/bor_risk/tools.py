@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import ssl
 import urllib.error
 import urllib.request
@@ -1126,11 +1127,27 @@ def fetch_url_content(url: str) -> tuple[str, str, str, str, int]:
         return "", "", "", url, 0
 
     content_hash = hashlib.sha256(raw_bytes).hexdigest()
-    mime_type = "application/pdf" if url.lower().endswith(".pdf") else "text/html"
+    # Detect PDFs by magic bytes first (more reliable than URL suffix).
+    if raw_bytes[:4] == b"%PDF":
+        mime_type = "application/pdf"
+    elif url.lower().endswith(".pdf"):
+        mime_type = "application/pdf"
+    else:
+        mime_type = "text/html"
 
     try:
         if mime_type == "application/pdf":
-            plain_text = raw_bytes.decode("utf-8", errors="replace")[:50_000]
+            try:
+                import io
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(raw_bytes))
+                plain_text = "\n".join(
+                    page.extract_text() or "" for page in reader.pages[:20]
+                )[:50_000]
+            except Exception:
+                # Fallback: strip non-printable chars from raw UTF-8 decode.
+                raw_decoded = raw_bytes.decode("utf-8", errors="replace")
+                plain_text = re.sub(r"[^\x09\x0a\x0d\x20-\x7e]", " ", raw_decoded)[:50_000]
             title = ""
         else:
             html_text = raw_bytes.decode("utf-8", errors="replace")
@@ -1339,6 +1356,47 @@ def link_mentions_to_claims(
 # ---------------------------------------------------------------------------
 
 
+def _name_variants(name: str, aliases: list[str] | None = None) -> set[str]:
+    """Return a set of lowercased name variants for fuzzy entity matching.
+
+    Generates: base name, name without parenthetical suffix, and an acronym
+    from capitalized words (only when ≥3 words to avoid short false positives
+    like 'LG'). Curated ``aliases`` from ``claim.aliases`` are always included.
+    """
+    name = name.strip()
+    variants: set[str] = {name.lower()}
+    # Strip parenthetical qualifiers like "Co. (Taiwan)"
+    paren_stripped = re.sub(r"\s*\(.*?\)\s*$", "", name).strip().lower()
+    if paren_stripped:
+        variants.add(paren_stripped)
+    # Acronym from ≥3 capitalized words only (avoids "LG", "3M" false positives)
+    cap_words = [w for w in name.split() if w and w[0].isupper()]
+    if len(cap_words) >= 3:
+        variants.add("".join(w[0] for w in cap_words).lower())
+    for alias in aliases or []:
+        alias = alias.strip().lower()
+        if alias:
+            variants.add(alias)
+    return variants
+
+
+def _any_variant_in_text(variants: set[str], text_lower: str) -> bool:
+    """Return True if any variant appears in *text_lower*.
+
+    Short tokens (≤4 chars) use word-boundary matching to prevent substring
+    false positives (e.g. 'lg' matching 'algae').
+    """
+    for v in variants:
+        if not v:
+            continue
+        if len(v) <= 4:
+            if re.search(r"\b" + re.escape(v) + r"\b", text_lower):
+                return True
+        elif v in text_lower:
+            return True
+    return False
+
+
 def verify_claim_against_evidence(
     claim: "Claim",  # noqa: F821
     evidence_text: str,
@@ -1369,9 +1427,16 @@ def verify_claim_against_evidence(
     company_lower = company.lower()
     supplier_lower = supplier.lower()
 
+    # Build alias-aware variant sets for both entities.
+    company_variants = _name_variants(company)
+    supplier_variants = _name_variants(supplier, aliases=getattr(claim, "aliases", None))
+
     # --- Stage 1: heuristic pre-filter ---
 
-    has_co_mention = company_lower in text_lower and supplier_lower in text_lower
+    has_co_mention = (
+        _any_variant_in_text(company_variants, text_lower)
+        and _any_variant_in_text(supplier_variants, text_lower)
+    )
     if not has_co_mention:
         return VerificationVerdict(
             verdict="UNKNOWN",

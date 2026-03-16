@@ -34,6 +34,7 @@ from bor_risk.budget import BudgetTracker
 from bor_risk.evidence_store import EvidenceStore
 from bor_risk.models import (
     Claim,
+    EvidencePacket,
     EvidenceSpan,
     GraphState,
     LocationCandidate,
@@ -64,6 +65,9 @@ CRITICAL_EXCEEDANCE_MARGIN = 0.2
 HAZARD_NAMES: list[str] = [h["name"] for h in load_hazards()]
 
 _STORE = EvidenceStore()
+
+# Verdict ranking for best-verdict selection (lower = better)
+_VERDICT_RANK: dict[str, int] = {"SUPPORTED": 0, "DISPUTED": 1, "WEAK": 2, "UNKNOWN": 3}
 
 
 # ---------------------------------------------------------------------------
@@ -194,10 +198,22 @@ def retrieve_evidence_node(state: GraphState) -> dict:
 
     claims = [Claim(**c) for c in state.get("claims", [])]
     existing_packets = state.get("evidence_packets", [])
-    seen_hashes = {p["content_hash"] for p in existing_packets}
+    # Build content_hash → evidence_id map so duplicate fetches link to
+    # the right existing packet rather than creating orphaned records.
+    existing_hash_to_eid: dict[str, str] = {
+        p["content_hash"]: p["evidence_id"]
+        for p in existing_packets
+        if p.get("content_hash")
+    }
+    seen_hashes: set[str] = set(existing_hash_to_eid.keys())
+
+    # In snapshot mode, pre-load the persistent URL index so live fetches
+    # are skipped for URLs already cached on disk across previous runs.
+    url_index: dict[str, dict] = _STORE.load_url_index() if snapshot_mode else {}
 
     now = datetime.now(timezone.utc).isoformat()
     new_packets: list[dict] = []
+    claim_to_eids: dict[str, list[str]] = {}
     _search_warned = False
 
     for claim in claims:
@@ -224,10 +240,29 @@ def retrieve_evidence_node(state: GraphState) -> dict:
             if not url:
                 continue
 
+            # Snapshot mode: reuse cached page content from the persistent
+            # URL index without making a live network request.
+            if snapshot_mode and url in url_index:
+                cached_eid = url_index[url]["evidence_id"]
+                claim_to_eids.setdefault(claim.claim_id, []).append(cached_eid)
+                # Ensure the packet appears in existing_hash_to_eid for dedup.
+                cached_hash = url_index[url].get("content_hash", "")
+                if cached_hash and cached_hash not in existing_hash_to_eid:
+                    existing_hash_to_eid[cached_hash] = cached_eid
+                    seen_hashes.add(cached_hash)
+                continue
+
             plain_text, content_hash, mime_type, final_url, http_status = (
                 fetch_url_content(url)
             )
-            if not plain_text or content_hash in seen_hashes:
+            if not plain_text:
+                continue
+
+            if content_hash in seen_hashes:
+                # Content already stored — link existing packet to this claim.
+                eid = existing_hash_to_eid.get(content_hash)
+                if eid:
+                    claim_to_eids.setdefault(claim.claim_id, []).append(eid)
                 continue
 
             seen_hashes.add(content_hash)
@@ -241,11 +276,26 @@ def retrieve_evidence_node(state: GraphState) -> dict:
                 http_status=http_status,
                 title=r.get("title", ""),
             )
+            eid = packet.evidence_id
+            existing_hash_to_eid[content_hash] = eid
             new_packets.append(packet.model_dump())
+            claim_to_eids.setdefault(claim.claim_id, []).append(eid)
 
+    # Write evidence_refs back onto each claim, advancing status to RETRIEVED.
+    updated_claims = [
+        claim.model_copy(update={
+            "evidence_refs": list(dict.fromkeys(
+                list(claim.evidence_refs) + claim_to_eids.get(claim.claim_id, [])
+            )),
+            "status": "RETRIEVED" if claim_to_eids.get(claim.claim_id) else claim.status,
+        }).model_dump()
+        for claim in claims
+    ]
+    linked_count = sum(1 for eids in claim_to_eids.values() if eids)
     return {
-        "evidence_packets": new_packets,
-        "workflow_trace": [f"retrieve_evidence({len(new_packets)})"],
+        "claims": updated_claims,
+        "evidence_packets": list(existing_packets) + new_packets,
+        "workflow_trace": [f"retrieve_evidence({len(new_packets)} new, {linked_count} claims linked)"],
     }
 
 
@@ -275,6 +325,9 @@ def extract_mentions_node(state: GraphState) -> dict:
             p = Path(snapshot_path)
             if p.exists():
                 doc_text = p.read_text(encoding="utf-8")
+        # Defensive fallback: read via content-hash if snapshot_path is missing/stale
+        if not doc_text and packet_dict.get("content_hash"):
+            doc_text = _STORE.read_snapshot(EvidencePacket(**packet_dict)) or ""
 
         if not doc_text:
             continue
@@ -327,11 +380,26 @@ def verify_claims_node(state: GraphState) -> dict:
     claims = [Claim(**c) for c in state.get("claims", [])]
     packets = {p["evidence_id"]: p for p in state.get("evidence_packets", [])}
     budget = state.get("_budget_tracker")
+    company = state.get("company", "")
+    company_lower = company.lower()
 
     verified_claims: list[dict] = []
     verified_count = 0
+    supplier_updates: dict[str, str] = {}  # normalized supplier name → evidence_source
 
     for claim in claims:
+        # Step 2: Safety-net fallback — scan all packets for co-mention when
+        # evidence_refs is empty (e.g. retrieval returned nothing for this claim).
+        if not claim.evidence_refs:
+            supplier_lower = claim.object_entity_id.lower()
+            for eid, packet_dict in packets.items():
+                text = _STORE.read_snapshot(EvidencePacket(**packet_dict)) or ""
+                if company_lower in text.lower() and supplier_lower in text.lower():
+                    claim = claim.model_copy(
+                        update={"evidence_refs": [eid], "status": "RETRIEVED"}
+                    )
+                    break
+
         if not claim.evidence_refs:
             verified_claims.append(claim.model_dump())
             continue
@@ -340,53 +408,79 @@ def verify_claims_node(state: GraphState) -> dict:
             verified_claims.append(claim.model_dump())
             continue
 
-        # Read evidence text for the first evidence ref with a snapshot
-        evidence_text = ""
-        used_eid = ""
-        for eid in claim.evidence_refs:
-            packet_dict = packets.get(eid)
-            if packet_dict:
-                sp = packet_dict.get("snapshot_path")
-                if sp:
-                    p = Path(sp)
-                    if p.exists():
-                        evidence_text = p.read_text(encoding="utf-8")
-                        used_eid = eid
-                        break
+        # Step 3: Iterate all evidence refs, keep best verdict by
+        # SUPPORTED > DISPUTED > WEAK > UNKNOWN.
+        best_verdict_obj = None
+        best_used_eid = ""
 
-        if not evidence_text:
+        for eid in claim.evidence_refs:
+            if budget and budget.llm_budget_remaining <= 0:
+                break
+            packet_dict = packets.get(eid)
+            if not packet_dict:
+                continue
+            evidence_text = _STORE.read_snapshot(EvidencePacket(**packet_dict)) or ""
+            if not evidence_text:
+                continue
+
+            verdict_obj = verify_claim_against_evidence(claim, evidence_text, budget)
+
+            if best_verdict_obj is None or (
+                _VERDICT_RANK[verdict_obj.verdict] < _VERDICT_RANK[best_verdict_obj.verdict]
+            ):
+                best_verdict_obj = verdict_obj
+                best_used_eid = eid
+
+            if best_verdict_obj.verdict == "SUPPORTED":
+                break  # Cannot improve further
+
+        if best_verdict_obj is None:
             verified_claims.append(claim.model_dump())
             continue
 
-        verdict_obj = verify_claim_against_evidence(claim, evidence_text, budget)
-
         update: dict = {
             "status": "VERIFIED",
-            "verdict": verdict_obj.verdict,
+            "verdict": best_verdict_obj.verdict,
             "verdict_explanation": (
-                f"{verdict_obj.rationale} [direction={verdict_obj.direction}]"
+                f"{best_verdict_obj.rationale} [direction={best_verdict_obj.direction}]"
             ),
         }
 
-        if verdict_obj.supporting_quote and used_eid:
+        if best_verdict_obj.supporting_quote and best_used_eid:
             span = EvidenceSpan(
-                evidence_id=used_eid,
-                quote=verdict_obj.supporting_quote,
+                evidence_id=best_used_eid,
+                quote=best_verdict_obj.supporting_quote,
             )
             existing_spans = claim.supporting_spans[:]
-            if not any(s.quote == verdict_obj.supporting_quote for s in existing_spans):
+            if not any(s.quote == best_verdict_obj.supporting_quote for s in existing_spans):
                 existing_spans.append(span)
             update["supporting_spans"] = [s.model_dump() for s in existing_spans]
 
         updated_claim = claim.model_copy(update=update)
         verified_claims.append(updated_claim.model_dump())
-        if verdict_obj.verdict in ("SUPPORTED", "WEAK"):
+        if best_verdict_obj.verdict in ("SUPPORTED", "WEAK"):
             verified_count += 1
+            # Step 5: Mark this supplier as web_verified for hazard-score weighting.
+            supplier_updates[updated_claim.object_entity_id.strip().lower()] = "web_verified"
 
-    return {
+    result: dict = {
         "claims": verified_claims,
         "workflow_trace": [f"verify_claims({verified_count} supported/weak)"],
     }
+
+    # Step 5: Propagate evidence_source updates back to the suppliers list.
+    if supplier_updates:
+        result["suppliers"] = [
+            {
+                **s,
+                "evidence_source": supplier_updates.get(
+                    s["name"].strip().lower(), s.get("evidence_source", "llm_only")
+                ),
+            }
+            for s in state.get("suppliers", [])
+        ]
+
+    return result
 
 
 def resolve_locations_node(state: GraphState) -> dict:

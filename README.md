@@ -2,75 +2,62 @@
 
 A supply-chain risk analysis system built with [LangGraph](https://github.com/langchain-ai/langgraph). Given a company name, it discovers suppliers across multiple tiers (via GPT-4o or deterministic fixtures), scores six geospatial hazards from real public data sources, aggregates risk with configurable weights, and produces an evidence-backed report with IEEE-style references.
 
-The system supports two execution modes — a **fixed pipeline** and an **autonomous ReAct agent** — enabling controlled comparison of dynamic vs fixed tool selection under identical budget constraints. A built-in evaluation framework computes ground-truth precision/recall, hard metrics (edge evidence rate, hazard coverage, cost), and LLM-as-judge narrative quality across four ablation conditions.
+The system implements a **Verified Claim Graph (VCG)** — a fixed 11-node pipeline that models supplier relationships as claims progressing through a `PROPOSED → RETRIEVED → VERIFIED` lifecycle. A built-in evaluation framework compares four ablation conditions, computing ground-truth precision/recall, hard metrics (edge evidence rate, hazard coverage, claim support rate), and LLM-as-judge narrative quality.
 
 ## Experimental Conditions
 
-The core thesis question: *Under a fixed LLM-call and web-query budget, does a dynamic tool-using agent produce a more evidence-grounded and accurate supplier-risk assessment than a fixed pipeline?*
+The core thesis question: *Under a fixed LLM-call and web-query budget, does adding web evidence retrieval and LLM entailment verification to a fixed Verified Claim Graph pipeline improve claim support rate, evidence coverage, and precision compared to an LLM-only baseline?*
 
-| Condition | Flag | Tool Selection | Web Search | Description |
-|-----------|------|---------------|------------|-------------|
-| A: Pipeline | `--mode pipeline` | Fixed | No | Baseline: fixed-order discovery and scoring |
-| B: Pipeline + Web | `--mode pipeline-web` | Fixed | Yes | Adds deterministic web verification (descending confidence order) |
-| C: Agent | `--mode agent` | Dynamic | No | ReAct agent chooses tools dynamically, no web access |
-| D: Agent + Web | `--mode agent-web` | Dynamic | Yes | Full system: agent chooses tools + web verification |
+| Condition | Flags | Web Search | Verification | Description |
+|-----------|-------|------------|--------------|-------------|
+| `llm_only` | `--no-web` | No | No | Baseline: LLM-proposed claims only, no web evidence |
+| `web_retrieve` | `--no-verify` | Yes | No | Adds web evidence retrieval; claims unverified |
+| `web_verify` | *(default)* | Yes | Yes | Full pipeline: retrieval + LLM entailment verification |
+| `strict` | `--strict` | Yes | Yes | web_verify + filter out DISPUTED/UNKNOWN claims |
 
 All conditions operate under the same budget caps (LLM calls and web queries tracked separately; hazard scoring is deterministic and uncapped).
 
 ## Architecture
 
-### Pipeline Mode (Conditions A/B)
+### VCG Pipeline (all conditions)
 
 ```
-START
-  -> discover_suppliers
-       -> [verify_suppliers]          (Condition B only)
-            |-> score_earthquake --\
-            |-> score_flood --------\
-            |-> score_wildfire -------> aggregate_risk
-            |-> score_cyclone ------/     -> decide_workflow (+ HITL interrupt)
-            |-> score_heat_stress -/          |-> high_risk_response --\
-            |-> score_drought ----/           |-> monitoring_response ---> generate_mitigations
-                                                                              -> suggest_alternatives
-                                                                                 -> format_report
-                                                                                    -> END
+resolve_entity → discover_claims
+  → [retrieve_evidence]       (skipped when --no-web)
+  → [extract_mentions]        (skipped when --no-web)
+  → [link_claims]             (skipped when --no-web)
+  → [verify_claims]           (skipped when --no-verify)
+  → resolve_locations
+  → [score_earthquake | score_flood | score_heat_stress |
+     score_drought | score_wildfire | score_cyclone]   (parallel fan-out)
+  → aggregate_risk → generate_report → export_artifacts → END
 ```
 
 | Node | Role |
 |------|------|
-| `discover_suppliers` | Two-step contextual discovery: resolves company profile via GPT-4o, then discovers suppliers with industry context. Falls back to JSON fixtures with `--no-llm` |
-| `verify_suppliers` | (Condition B only) Verifies suppliers against web evidence in descending confidence order until web budget is exhausted |
-| `score_{hazard}` (x6) | Scores all suppliers for one hazard type (runs in parallel) |
-| `aggregate_risk` | Weighted average of hazard scores with confidence, tier, and evidence-source adjustments |
-| `decide_workflow` | Routes to escalation or monitoring; pauses for human approval when interactive |
-| `high_risk_response` | Builds P1/P2 escalation actions for high-risk cases |
-| `monitoring_response` | Builds P3 monitoring actions for lower-risk cases |
-| `generate_mitigations` | GPT-4o generates location-specific mitigation strategies (skipped with `--no-llm`) |
-| `suggest_alternatives` | GPT-4o suggests lower-risk alternative suppliers (skipped with `--no-llm`) |
-| `format_report` | Produces the final plain-text report |
+| `resolve_entity` | Resolves company profile via GPT-4o (or fixture) |
+| `discover_claims` | LLM proposes supplier relationships as PROPOSED claims with deterministic `claim_id = sha256(subject\|object\|type\|tier)[:12]` |
+| `retrieve_evidence` | Web-searches for each claim; stores full page content in content-addressed `EvidenceStore`; writes `evidence_refs` back onto claims (PROPOSED → RETRIEVED) |
+| `extract_mentions` | LLM extracts supplier mentions from each fetched document |
+| `link_claims` | Fuzzy-matches mentions to claims via rapidfuzz token_set_ratio ≥ 85 |
+| `verify_claims` | Two-stage verification: heuristic co-mention + negation check (Stage 1), LLM entailment (Stage 2), verbatim substring guard (Stage 3); iterates all evidence refs and keeps best verdict by SUPPORTED > DISPUTED > WEAK > UNKNOWN |
+| `resolve_locations` | Enriches supplier lat/lon from evidence text |
+| `score_{hazard}` (x6) | Scores all suppliers for one hazard type (parallel fan-out) |
+| `aggregate_risk` | Weighted hazard average with confidence, tier, and evidence-source adjustments |
+| `generate_report` | GPT-4o generates mitigations and alternatives; formats plain-text report |
+| `export_artifacts` | Writes report, graph JSON, evidence JSONL, optional PROV-O |
 
-### Agent Mode (Conditions C/D)
+### Claim Lifecycle
 
-The autonomous agent uses `create_react_agent` from LangGraph with 8 tools as closures over a shared accumulator and budget tracker:
+LLM-discovered suppliers are modelled as **claims** (verifiable hypotheses):
 
-| Tool | Budget Cost | Purpose |
-|------|------------|---------|
-| `profile_company` | 1 LLM call | Understand company industry and products |
-| `discover_suppliers` | 1 LLM call | Generate candidate suppliers (hypotheses) |
-| `web_search` | 1 web query | Search for supplier data from news/filings (Condition D only) |
-| `verify_supplier` | 1 web query | Verify a supply relationship via co-mention matching (Condition D only) |
-| `score_hazard` | Free | Score one supplier for one hazard (deterministic) |
-| `aggregate_risk` | Free | Compute company risk summary |
-| `generate_mitigations` | 1 LLM call | Create mitigation strategies |
-| `suggest_alternatives` | 1 LLM call | Suggest lower-risk alternatives |
+- **PROPOSED**: LLM has proposed a supplier relationship
+- **RETRIEVED**: Web evidence found and linked (`evidence_refs` populated)
+- **VERIFIED**: LLM entailment run; verdict assigned
 
-The agent decides which suppliers to verify first, which hazards to prioritise per geography, and when to stop — spending budget where uncertainty reduction has the most impact.
+Verdicts: `SUPPORTED` / `WEAK` / `DISPUTED` / `UNKNOWN`
 
-### Supplier Verification
-
-LLM-discovered suppliers are treated as **hypotheses**. Verification searches for **relationship evidence** — a web source that co-mentions both the company and supplier with relationship cues (supplier, vendor, manufactures, supplies, partner, contract, etc.).
-
-Verified suppliers (`evidence_source: "web_verified"`) carry full confidence weight in aggregation. Unverified suppliers (`evidence_source: "llm_only"`) have their effective confidence halved (x0.5) to reflect epistemic uncertainty.
+Verified suppliers (`evidence_source: "web_verified"`) carry full confidence weight in aggregation. Unverified suppliers (`evidence_source: "llm_only"`) have their effective confidence halved (×0.5) to reflect epistemic uncertainty.
 
 ## Installation
 
@@ -87,7 +74,7 @@ OPENAI_API_KEY=sk-...
 TAVILY_API_KEY=tvly-...
 ```
 
-The OpenAI key is required for GPT-4o supplier discovery and mitigations. The Tavily key is required for web search in Conditions B and D.
+The OpenAI key is required for GPT-4o supplier discovery and mitigations. The Tavily key is required for web search in the `web_retrieve`, `web_verify`, and `strict` conditions.
 
 ### Data preprocessing (one-time)
 
@@ -101,46 +88,34 @@ The preprocessed grids are included in the repository, so this step is only need
 
 ## Usage
 
-### Pipeline mode (Condition A — baseline)
+### LLM-only baseline (no web, no verification)
 
 ```bash
-python3 -m bor_risk.cli --company "Apple" --mode pipeline --out outputs/apple.txt
+python3 -m bor_risk.cli --company "Apple" --no-web --out outputs/apple.txt
 ```
 
-### Pipeline + web verification (Condition B)
+### Web retrieval only (no entailment verification)
 
 ```bash
-python3 -m bor_risk.cli --company "Apple" --mode pipeline-web --budget-web 30 --out outputs/apple.txt
+python3 -m bor_risk.cli --company "Apple" --no-verify --budget-web 30 --out outputs/apple.txt
 ```
 
-### Agent mode (Condition C — no web)
+### Full pipeline — web retrieval + verification (default)
 
 ```bash
-python3 -m bor_risk.cli --company "Apple" --mode agent --budget-llm 20 --out outputs/apple.txt
+python3 -m bor_risk.cli --company "Apple" --out outputs/apple.txt
 ```
 
-### Agent + web (Condition D — full system)
+### Strict mode (filter DISPUTED/UNKNOWN claims)
 
 ```bash
-python3 -m bor_risk.cli --company "Apple" --mode agent-web --budget-llm 20 --budget-web 30 --out outputs/apple.txt
+python3 -m bor_risk.cli --company "Apple" --strict --out outputs/apple.txt
 ```
 
 ### Deterministic run (no API key needed)
 
 ```bash
 python3 -m bor_risk.cli --company "ACME" --out outputs/acme.txt --no-llm
-```
-
-### Interactive mode (streaming + human-in-the-loop)
-
-```bash
-python3 -m bor_risk.cli --company "Apple" --out outputs/apple.txt --interactive
-```
-
-### With sensitivity analysis
-
-```bash
-python3 -m bor_risk.cli --company "ACME" --out outputs/acme.txt --no-llm --sensitivity
 ```
 
 ### Graph visualisation
@@ -155,16 +130,17 @@ python3 -m bor_risk.cli --company "Apple" --out outputs/apple.txt --visualize
 |------|----------|---------|-------------|
 | `--company` | Yes | — | Target company name |
 | `--out` | Yes | — | Output path (directory derived from parent) |
-| `--mode` | No | `pipeline` | Experimental condition: `pipeline`, `pipeline-web`, `agent`, `agent-web` |
+| `--no-web` | No | off | Disable web retrieval (llm_only condition) |
+| `--no-verify` | No | off | Skip LLM entailment verification (web_retrieve condition) |
+| `--strict` | No | off | Exclude DISPUTED/UNKNOWN claims from report (strict condition) |
 | `--tier-depth` | No | 2 | Number of supplier tiers to expand |
 | `--no-llm` | No | off | Use deterministic JSON fixtures instead of GPT-4o |
 | `--suppliers-path` | No | — | Path to custom supplier JSON file |
-| `--interactive` | No | off | Streaming output + human-in-the-loop approval |
-| `--sensitivity` | No | off | Run weight/threshold sensitivity analysis |
+| `--budget-llm` | No | 20 | Max LLM calls per run |
+| `--budget-web` | No | 30 | Max web queries per run |
+| `--snapshot` | No | off | Use cached web results + persistent URL index (reproducible) |
+| `--export-prov` | No | off | Export PROV-O JSON-LD provenance file |
 | `--visualize` | No | off | Print Mermaid graph diagram and exit |
-| `--budget-llm` | No | 20 | Max LLM calls (agent and pipeline-web modes) |
-| `--budget-web` | No | 30 | Max web queries (agent-web and pipeline-web modes) |
-| `--snapshot` | No | off | Use cached web results only (reproducible evaluation) |
 
 ## Evaluation Framework
 
@@ -186,11 +162,15 @@ Computed for companies with curated supplier lists (Apple, Toyota, Nike):
 | Metric | Description |
 |--------|-------------|
 | Edge evidence rate | Fraction of suppliers with web verification |
-| Hazard coverage | Scored pairs / (suppliers x 6) |
+| Hazard coverage | Scored pairs / (suppliers × 6) |
+| Claim support rate | (SUPPORTED + WEAK) / total claims |
+| Unknown rate | UNKNOWN / total claims |
+| Quote valid rate | Supported claims with verbatim quote / supported claims |
+| Mean evidence/claim | Average `evidence_refs` count per claim |
+| Unique web domains | Distinct source domains in evidence_packets |
 | LLM calls used | Count from BudgetTracker |
 | Web queries used | Count from BudgetTracker |
 | Wall clock time | End-to-end execution time |
-| Unique web sources | Distinct URLs in evidence |
 | Unverified fraction | `llm_only / total` suppliers |
 
 ### Tier 3: LLM-as-Judge (Supplementary)
@@ -200,23 +180,20 @@ GPT-4o rates narrative quality (1-5) on completeness, actionability, and risk co
 ### Running evaluations
 
 ```bash
-# Evaluate ground-truth companies across all 4 conditions
-python3 -m bor_risk.evaluate --ground-truth-only --out outputs/eval/
+# Ground-truth case study (Apple, Toyota, Nike — precision/recall metrics)
+python3 -m bor_risk.evaluate --companies "Apple,Toyota,Nike" --skip-judge --out outputs/eval/
 
-# Evaluate specific companies
-python3 -m bor_risk.evaluate --companies "Apple,Toyota,Boeing" --out outputs/eval/
+# Reproducible snapshot rerun (cached web results + persistent URL index)
+python3 -m bor_risk.evaluate --companies "Apple,Toyota,Nike" --snapshot --skip-judge --out outputs/eval/
 
-# Full 30-company benchmark
-python3 -m bor_risk.evaluate --full --out outputs/eval/
+# Broader hard-metric benchmark (fixture suppliers, no LLM discovery)
+python3 -m bor_risk.evaluate --companies "Apple,Toyota,Nike" --no-llm --snapshot --out outputs/eval_broad/
 
-# Reproducible run (snapshot mode — cached web results only)
-python3 -m bor_risk.evaluate --full --snapshot --out outputs/eval/
+# Specific conditions only
+python3 -m bor_risk.evaluate --companies "Apple,Toyota,Nike" --conditions "llm_only,web_verify" --skip-judge --out outputs/eval/
 
 # Custom budget
-python3 -m bor_risk.evaluate --full --budget-llm 15 --budget-web 25 --out outputs/eval/
-
-# Skip LLM judge (saves API calls during development)
-python3 -m bor_risk.evaluate --ground-truth-only --skip-judge --out outputs/eval/
+python3 -m bor_risk.evaluate --companies "Apple,Toyota,Nike" --budget-llm 15 --budget-web 25 --out outputs/eval/
 ```
 
 Evaluation outputs:
@@ -308,28 +285,26 @@ LLM prompt templates for company profile resolution, supplier discovery, mitigat
 
 ## Testing
 
-185 tests across 14 test files:
-
 ```bash
 python3 -m pytest -v
 ```
 
-| Test File | Tests | Coverage |
-|-----------|-------|----------|
-| `test_hazard_scoring.py` | 40 | Score normalisation, all 6 hazard APIs, edge cases, hash stub fallback |
-| `test_enhanced_report.py` | 24 | Report sections, risk matrix, IEEE references, evidence appendix |
-| `test_langgraph_features.py` | 21 | Graph topology, parallel fan-out/fan-in, HITL interrupts, streaming |
-| `test_llm_discovery.py` | 18 | Company profile resolution, contextual prompts, deduplication |
-| `test_sensitivity.py` | 13 | Pure function parity, scenario generation, weight/threshold perturbation |
-| `test_agent_tools.py` | 11 | Tool building, budget enforcement, verify/unverify, relationship cues |
-| `test_tier_expansion.py` | 10 | End-to-end graph run, CLI output files, supplier loading |
-| `test_evaluation.py` | 10 | Ground truth loading, precision/recall, hard metrics, summary formatting |
-| `test_suggest_alternatives.py` | 8 | Alternative supplier suggestions, LLM mock, report rendering |
-| `test_budget.py` | 7 | BudgetTracker state, budget exhaustion, summary |
-| `test_verification.py` | 6 | Pipeline batch verification, co-mention matching, evidence-source weighting |
-| `test_mitigation_generation.py` | 6 | Mitigation prompts, priority levels, report integration |
-| `test_workflow_decision.py` | 4 | Routing logic, risk band assignment |
-| `test_search.py` | 3 | Snapshot mode, cache hits/misses, max_results |
+| Test File | Coverage |
+|-----------|----------|
+| `test_hazard_scoring.py` | Score normalisation, all 6 hazard APIs, edge cases, hash stub fallback |
+| `test_enhanced_report.py` | Report sections, risk matrix, IEEE references, evidence appendix |
+| `test_langgraph_features.py` | Graph topology, parallel fan-out/fan-in, streaming |
+| `test_llm_discovery.py` | Company profile resolution, contextual prompts, deduplication |
+| `test_sensitivity.py` | Pure function parity, scenario generation, weight/threshold perturbation |
+| `test_tier_expansion.py` | End-to-end graph run, CLI output files, supplier loading |
+| `test_evaluation.py` | Ground truth loading, precision/recall, hard metrics, summary formatting |
+| `test_claim_lifecycle.py` | Claim PROPOSED→RETRIEVED→VERIFIED lifecycle, link + verify tools |
+| `test_evidence_store.py` | Content-addressed store, dedup, snapshot read, URL index |
+| `test_provenance.py` | PROV-O JSON-LD export |
+| `test_suggest_alternatives.py` | Alternative supplier suggestions, LLM mock, report rendering |
+| `test_budget.py` | BudgetTracker state, budget exhaustion, summary |
+| `test_verification.py` | Co-mention matching, alias variants, evidence-source weighting |
+| `test_search.py` | Snapshot mode, cache hits/misses, max_results |
 
 ### Mock strategy
 
@@ -349,17 +324,17 @@ bor-risk-agent/
       apple.json
       toyota.json
       nike.json
-    search_cache/              # Cached web search results (not tracked in git)
+    evidence_cache/            # Content-addressed full-page snapshots + URL index
+      packet_index.json        # Persistent URL → packet metadata (for snapshot reruns)
+    search_cache/              # Cached Tavily search snippets (not tracked in git)
     raw/                       # Source data files (not tracked in git)
   scripts/
     download_data.py           # Downloads IBTrACS + finds FIRMS CSV
     preprocess_cyclone.py      # Converts IBTrACS CSV to 1-degree grid JSON
     preprocess_wildfire.py     # Converts FIRMS VIIRS CSV to 0.5-degree grid JSON
   src/bor_risk/
-    cli.py                     # CLI entry point (--mode, --budget-llm, --budget-web, etc.)
-    graph.py                   # LangGraph pipeline (15 nodes, fan-out/fan-in, conditional verify)
-    agent.py                   # ReAct agent via create_react_agent
-    agent_tools.py             # 8 LangChain @tool closures for the agent
+    cli.py                     # CLI entry point (--no-web, --no-verify, --strict, etc.)
+    graph.py                   # 11-node VCG LangGraph pipeline
     budget.py                  # BudgetTracker (LLM calls, web queries, hazard scores)
     search.py                  # Tavily web search with disk cache + snapshot mode
     evaluate.py                # 3-tier evaluation framework + CLI

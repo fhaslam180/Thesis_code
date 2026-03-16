@@ -121,7 +121,7 @@ class TestHardMetrics:
         assert metrics["hazard_scores_count"] == 2
         assert metrics["llm_calls"] == 3
         assert metrics["web_queries"] == 5
-        assert metrics["unique_web_sources"] == 1
+        assert metrics["unique_web_domains"] == 1
         assert metrics["unverified_fraction"] > 0  # 1/3 llm_only
 
     def test_claim_metrics(self):
