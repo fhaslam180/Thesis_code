@@ -62,6 +62,7 @@ class HazardScore(BaseModel):
     score: float = Field(ge=0.0, le=1.0)
     score_100: int = Field(ge=0, le=100)
     level: str = Field(pattern=r"^(Low|Medium|High)$")
+    raw_value: float = 0.0      # Physical quantity before percentile-rank normalisation
     dataset_metadata: dict = Field(default_factory=dict)
 
 

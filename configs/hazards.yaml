@@ -1,20 +1,23 @@
-# Hazard types and scoring thresholds
+# Hazard types — display metadata only.
+# Weights are 1/N_HAZARDS (equal) defined as code constant N_HAZARDS=6.
+# Thresholds come from data/reference_set.json (supplier_exposure_thresholds,
+# company_exposure_thresholds), not this file.
 hazards:
   - name: earthquake
-    weight: 0.25
-    threshold: 0.5
+    label: "Seismic"
+    unit: "g (PGA)"
   - name: flood
-    weight: 0.20
-    threshold: 0.4
+    label: "River Flood"
+    unit: "m depth (100-yr RP)"
   - name: wildfire
-    weight: 0.15
-    threshold: 0.5
+    label: "Wildfire"
+    unit: "approx. FWI Q95"
   - name: cyclone
-    weight: 0.15
-    threshold: 0.5
+    label: "Cyclone"
+    unit: "km/h (V_100)"
   - name: heat_stress
-    weight: 0.10
-    threshold: 0.6
+    label: "Apparent Heat Stress"
+    unit: "fraction days >= 32 deg C"
   - name: drought
-    weight: 0.15
-    threshold: 0.5
+    label: "Drought"
+    unit: "fraction months SPEI-12 <= -1"

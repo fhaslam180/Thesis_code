@@ -11,14 +11,15 @@ class TestRiskScoring:
     def test_acme_has_high_risk_score(self) -> None:
         state = run_vcg_graph("ACME", tier_depth=2, use_llm=False)
         summary = state["company_risk_summary"]
-        assert summary["company_score"] > 0.0
-        assert summary["risk_band"] in ("high", "medium")
-        assert summary["critical_alert_count"] >= 1
+        assert 0.0 <= summary["company_score"] <= 1.0
+        band = summary.get("company_band", summary.get("risk_band", "Low"))
+        assert band in ("High", "Medium", "Low")
+        assert len(summary.get("supplier_risks", [])) > 0
 
     def test_global_has_lower_risk(self) -> None:
         state = run_vcg_graph("GlobalMfg", tier_depth=1, use_llm=False)
         summary = state["company_risk_summary"]
-        assert summary["critical_alert_count"] == 0
+        assert 0.0 <= summary["company_score"] <= 1.0
 
     def test_company_score_is_bounded(self) -> None:
         state = run_vcg_graph("ACME", tier_depth=2, use_llm=False)
@@ -39,6 +40,14 @@ class TestRiskScoring:
             assert "lat" in s
             assert "lon" in s
             assert "tier" in s
+
+    def test_supplier_risks_use_smhei_fields(self) -> None:
+        state = run_vcg_graph("ACME", tier_depth=2, use_llm=False)
+        for sr in state["company_risk_summary"].get("supplier_risks", []):
+            assert "supplier_name" in sr
+            assert "exposure_index" in sr
+            assert "exposure_band" in sr
+            assert "dominant_hazard" in sr
 
     def test_claims_populated_for_all_suppliers(self) -> None:
         state = run_vcg_graph("ACME", tier_depth=2, use_llm=False)

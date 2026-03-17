@@ -107,54 +107,44 @@ class TestVerifySuppliersBatch:
 
 
 class TestEvidenceSourceWeighting:
-    def test_llm_only_gets_halved_confidence(self):
-        """Unverified LLM suppliers get halved confidence in aggregation."""
-        hazard_scores = [
-            {"supplier_name": "Verified", "hazard_type": "earthquake",
-             "score": 0.5, "score_100": 50, "level": "Medium",
-             "dataset_metadata": {}},
-            {"supplier_name": "Unverified", "hazard_type": "earthquake",
-             "score": 0.5, "score_100": 50, "level": "Medium",
-             "dataset_metadata": {}},
-        ]
-        suppliers = [
-            {"name": "Verified", "tier": 1, "confidence": 0.8,
-             "evidence_source": "web_verified"},
-            {"name": "Unverified", "tier": 1, "confidence": 0.8,
-             "evidence_source": "llm_only"},
-        ]
-        weights = {"earthquake": 1.0}
-        thresholds = {"earthquake": 1.0}
+    """SMHEI does not apply confidence/evidence penalties to exposure_index.
 
-        summary = compute_risk_summary(
-            hazard_scores, suppliers, weights, thresholds
+    Evidence source is preserved as informational metadata only. Both
+    llm_only and fixture suppliers get the same exposure_index for equal
+    hazard scores, which is the intentional SMHEI design (purely physical).
+    """
+    def _make_hazard_scores_6(self, supplier_name: str, score: float) -> list[dict]:
+        return [
+            {"supplier_name": supplier_name, "hazard_type": h, "score": score,
+             "score_100": round(score * 100), "level": "Medium", "dataset_metadata": {}}
+            for h in ("earthquake", "flood", "wildfire", "cyclone", "heat_stress", "drought")
+        ]
+
+    def test_llm_only_and_verified_get_same_exposure_index(self):
+        """SMHEI does not penalize llm_only suppliers — purely physical aggregation."""
+        hazard_scores = (
+            self._make_hazard_scores_6("Verified", 0.5)
+            + self._make_hazard_scores_6("Unverified", 0.5)
         )
-
+        suppliers = [
+            {"name": "Verified", "tier": 1, "confidence": 0.8, "evidence_source": "web_verified"},
+            {"name": "Unverified", "tier": 1, "confidence": 0.8, "evidence_source": "llm_only"},
+        ]
+        summary = compute_risk_summary(hazard_scores, suppliers)
         risks = {r["supplier_name"]: r for r in summary["supplier_risks"]}
-        assert risks["Verified"]["risk_score"] > risks["Unverified"]["risk_score"]
+        assert risks["Verified"]["exposure_index"] == risks["Unverified"]["exposure_index"]
 
-    def test_fixture_sources_not_penalised(self):
-        """Suppliers from test fixtures use full confidence."""
-        hazard_scores = [
-            {"supplier_name": "Fixture", "hazard_type": "earthquake",
-             "score": 0.5, "score_100": 50, "level": "Medium",
-             "dataset_metadata": {}},
-        ]
-        suppliers = [
-            {"name": "Fixture", "tier": 1, "confidence": 0.8,
-             "evidence_source": "fixture"},
-        ]
-        weights = {"earthquake": 1.0}
-        thresholds = {"earthquake": 1.0}
-
-        summary = compute_risk_summary(
-            hazard_scores, suppliers, weights, thresholds
-        )
-
+    def test_fixture_sources_pass_through(self):
+        """Fixture suppliers pass through with correct exposure_index."""
+        hazard_scores = self._make_hazard_scores_6("Fixture", 0.5)
+        suppliers = [{"name": "Fixture", "tier": 1, "confidence": 0.8, "evidence_source": "fixture"}]
+        summary = compute_risk_summary(hazard_scores, suppliers)
         risk = summary["supplier_risks"][0]
-        # With evidence_source="fixture", confidence_factor = 0.5 + 0.5*0.8 = 0.9
-        expected = round(0.5 * 0.9, 4)
-        assert risk["risk_score"] == expected
+        assert risk["exposure_index"] == pytest.approx(0.5, abs=1e-4)
+        assert "exposure_band" in risk
+        assert "dominant_hazard" in risk
+
+import pytest
 
 
 # ---------------------------------------------------------------------------

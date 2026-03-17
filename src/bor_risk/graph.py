@@ -545,18 +545,17 @@ _HAZARD_SCORER_NODES = {name: _make_hazard_scorer(name) for name in HAZARD_NAMES
 
 
 def aggregate_risk_node(state: GraphState) -> dict:
-    """Node 9: Roll up supplier and company risk from hazard scores."""
-    hazard_defs = load_hazards()
-    weights = {h["name"]: float(h.get("weight", 1.0)) for h in hazard_defs}
-    thresholds = {h["name"]: float(h.get("threshold", 1.0)) for h in hazard_defs}
+    """Node 9: Roll up supplier and company SMHEI from hazard scores.
 
+    Uses default equal-weight arithmetic mean over N_HAZARDS=6 hazards.
+    Bands are read from reference_set.json (supplier_exposure_thresholds,
+    company_exposure_thresholds), not from hard-coded constants.
+    """
     summary = compute_risk_summary(
         state.get("hazard_scores", []),
         state.get("suppliers", []),
-        weights,
-        thresholds,
-        high_risk_threshold=HIGH_RISK_THRESHOLD,
-        critical_exceedance_margin=CRITICAL_EXCEEDANCE_MARGIN,
+        # weights=None → equal 1/N_HAZARDS (primary SMHEI)
+        # aggregation="arithmetic" → default
     )
 
     return {

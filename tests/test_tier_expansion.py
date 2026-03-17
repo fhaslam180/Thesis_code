@@ -29,7 +29,7 @@ class TestRunGraph:
 
     def test_report_text_present(self) -> None:
         state = run_graph("ACME", tier_depth=2)
-        assert "Supply-Chain Risk Report" in state["report_text"]
+        assert "SMHEI" in state["report_text"]
 
     def test_different_company(self) -> None:
         state = run_graph("GlobalMfg", tier_depth=1, use_llm=False)

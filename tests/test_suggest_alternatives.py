@@ -95,7 +95,7 @@ class TestSuggestAlternativesLLM:
             mock_cls.return_value.with_structured_output.return_value.invoke.call_args[0][0]
         )
         prompt_text = invoke_args[0].content
-        assert "Company risk score:" in prompt_text
+        assert "Company exposure score:" in prompt_text
         assert "Suppliers:" in prompt_text
 
 

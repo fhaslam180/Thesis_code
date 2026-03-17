@@ -134,7 +134,7 @@ class TestVCGIntegration:
         assert "company_risk_summary" in state
         summary = state["company_risk_summary"]
         assert 0.0 <= summary["company_score"] <= 1.0
-        assert summary["risk_band"] in ("high", "medium", "low")
+        assert summary["company_band"] in ("High", "Medium", "Low")
 
     def test_run_trace_contains_core_nodes(self) -> None:
         state = run_vcg_graph("ACME", tier_depth=2, use_llm=False)

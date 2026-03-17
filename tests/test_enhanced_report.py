@@ -39,11 +39,11 @@ class TestExecutiveSummary:
         section = report[idx : idx + 500]
         assert str(len(state["suppliers"])) in section
 
-    def test_contains_critical_mention(self) -> None:
+    def test_contains_exposure_mention(self) -> None:
         report = _acme_state()["report_text"]
         idx = report.index("--- Executive Summary ---")
         section = report[idx : idx + 500].lower()
-        assert "critical" in section
+        assert "exposure" in section
 
 
 class TestNarrativeSections:
@@ -143,7 +143,8 @@ class TestEvidenceAppendix:
         report = _acme_state()["report_text"]
         idx = report.index("--- Evidence Appendix ---")
         section = report[idx:]
-        assert "usgs_earthquake_catalog" in section
+        # Check for one of the new SMHEI datasets
+        assert any(ds in section for ds in ("GEM_2023", "Aqueduct_Floods", "STORM_2020", "Open-Meteo"))
 
 
 class TestIEEEReferences:
@@ -180,7 +181,7 @@ class TestExistingMarkersPreserved:
 
     def test_supply_chain_risk_report_marker(self) -> None:
         report = _acme_state()["report_text"]
-        assert "Supply-Chain Risk Report" in report
+        assert "SMHEI" in report
 
     def test_pipeline_workflow_marker(self) -> None:
         report = _acme_state()["report_text"]

@@ -216,7 +216,7 @@ class TestRunGraphWithLLM:
         with patch("bor_risk.tools.ChatOpenAI", mock_cls):
             state = run_graph("ACME", tier_depth=1, use_llm=True)
 
-        assert "Supply-Chain Risk Report" in state["report_text"]
+        assert "SMHEI" in state["report_text"]
         assert len(state["suppliers"]) > 0
         assert len(state["hazard_scores"]) > 0
         assert len(state["edges"]) > 0

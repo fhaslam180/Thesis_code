@@ -10,29 +10,21 @@ from bor_risk.models import GraphState
 from bor_risk.utils import load_hazards
 
 _DATASET_URLS: dict[str, tuple[str, str]] = {
-    "usgs_earthquake_catalog": (
-        "USGS",
-        "https://earthquake.usgs.gov/fdsnws/event/1/count",
+    "GEM_2023": (
+        "GEM Foundation",
+        "https://github.com/GEMScienceTools/oq-mbtk",
     ),
-    "glofas_river_discharge": (
-        "Copernicus / Open-Meteo",
-        "https://flood-api.open-meteo.com/v1/flood",
+    "Aqueduct_Floods": (
+        "WRI Aqueduct",
+        "https://www.wri.org/data/aqueduct-floods-hazard-maps",
     ),
-    "era5_reanalysis": (
-        "ECMWF / Open-Meteo",
+    "STORM_2020": (
+        "STORM dataset",
+        "https://www.science.org/doi/10.1126/sciadv.aba8275",
+    ),
+    "Open-Meteo ERA5": (
+        "Open-Meteo / ECMWF ERA5",
         "https://archive-api.open-meteo.com/v1/archive",
-    ),
-    "era5_precipitation": (
-        "ECMWF / Open-Meteo",
-        "https://archive-api.open-meteo.com/v1/archive",
-    ),
-    "viirs_active_fire_annual": (
-        "NASA FIRMS",
-        "https://firms.modaps.eosdis.nasa.gov/",
-    ),
-    "ibtracs": (
-        "NOAA NCEI",
-        "https://www.ncei.noaa.gov/products/international-best-track-archive",
     ),
 }
 
@@ -62,54 +54,76 @@ def _build_executive_summary(
     company: str,
     suppliers: list[dict],
     summary: dict,
+    reference_set: dict | None = None,
 ) -> list[str]:
     """Deterministic executive summary with human-readable narrative."""
     score = summary.get("company_score", 0.0)
-    band = summary.get("risk_band", "unknown")
-    critical_count = summary.get("critical_alert_count", 0)
+    band = summary.get("company_band", summary.get("risk_band", "unknown"))
     supplier_risks = summary.get("supplier_risks", [])
-    hazard_alerts = summary.get("hazard_alerts", [])
 
     top_name = supplier_risks[0]["supplier_name"] if supplier_risks else "N/A"
-    top_score = supplier_risks[0]["risk_score"] if supplier_risks else 0.0
+    top_score = supplier_risks[0].get("exposure_index", supplier_risks[0].get("risk_score", 0.0)) if supplier_risks else 0.0
     top_three = [
-        f"{item['supplier_name']} ({item['risk_score']:.2f})"
+        f"{item['supplier_name']} ({item.get('exposure_index', item.get('risk_score', 0.0)):.3f})"
         for item in supplier_risks[:3]
     ]
-    hazard_counts = Counter(alert["hazard_type"] for alert in hazard_alerts)
+
+    # Dominant hazard across all suppliers
+    dominant_counts: dict[str, int] = {}
+    for sr in supplier_risks:
+        dh = sr.get("dominant_hazard")
+        if dh:
+            dominant_counts[dh] = dominant_counts.get(dh, 0) + 1
+    top_dominant = sorted(dominant_counts, key=dominant_counts.get, reverse=True)[:2]  # type: ignore[arg-type]
     dominant_hazards = [
-        f"{_humanize_hazard(name)} ({count})"
-        for name, count in hazard_counts.most_common(2)
+        f"{_humanize_hazard(name)} ({dominant_counts[name]} suppliers)"
+        for name in top_dominant
     ]
 
     supplier_phrase = ""
     if top_three:
         supplier_phrase = (
-            f" The top {len(top_three)} supplier(s) by risk are "
+            f" The top {len(top_three)} supplier(s) by exposure index are "
             f"{_join_with_and(top_three)}."
         )
     overview_paragraph = (
-        f"  Overall exposure is {band.upper()} (composite score: {score:.4f}). "
-        f"The highest-risk supplier is {top_name} with a score of {top_score:.4f}."
+        f"  Overall company exposure is {band.upper()} "
+        f"(Supplier Multi-Hazard Exposure Index mean: {score:.4f}). "
+        f"The highest-exposure supplier is {top_name} (E_s = {top_score:.4f})."
         f"{supplier_phrase}"
+    )
+
+    dominant_phrase = (
+        f" Dominant hazard(s) across suppliers: {_join_with_and(dominant_hazards)}."
+        if dominant_hazards else ""
     )
 
     lines = [
         "--- Executive Summary ---",
         "",
-        f"  This report provides a narrative assessment of {company}'s supply-chain "
-        f"hazard exposure across {len(suppliers)} analysed supplier(s).",
+        f"  This report provides a Supplier Multi-Hazard Exposure Index (SMHEI) "
+        f"assessment for {company}'s supply chain across {len(suppliers)} supplier(s). "
+        f"SMHEI = equal-weight arithmetic mean of 6 hazard percentile ranks.",
         "",
         overview_paragraph,
         "",
-        f"  {critical_count} critical threshold alert(s) were identified"
-        + (" requiring immediate attention." if critical_count > 0 else ".")
-        + (
-            f" Alert concentration is highest in {_join_with_and(dominant_hazards)}."
-            if dominant_hazards else ""
-        ),
+        f"  Exposure bands are defined by empirical tertiles of the study-specific "
+        f"reference corpus.{dominant_phrase}",
         "",
     ]
+
+    # Non-informative hazard footnote
+    if reference_set:
+        non_inform = reference_set.get("metadata", {}).get("non_informative_hazards", [])
+        if non_inform:
+            lines.append(
+                f"  NOTE: The following hazard(s) were non-informative across the "
+                f"reference corpus and assigned a neutral score of 0.5: "
+                f"{', '.join(non_inform)}. They contribute no discriminating "
+                f"information to the composite index."
+            )
+            lines.append("")
+
     return lines
 
 
@@ -122,7 +136,7 @@ def _build_narrative_assessment(
     """Narrative interpretation section before detailed data tables."""
     supplier_risks = summary.get("supplier_risks", [])
     top_suppliers = [
-        f"{item['supplier_name']} ({item['risk_score']:.2f})"
+        f"{item['supplier_name']} ({item.get('exposure_index', item.get('risk_score', 0.0)):.3f})"
         for item in supplier_risks[:5]
     ]
 
@@ -456,6 +470,8 @@ def _build_claim_summary(state: GraphState) -> list[str]:
 
 def format_report(state: GraphState) -> str:
     """Produce a plain-text report from the graph state."""
+    from bor_risk.utils import load_reference_set
+
     company = state.get("company", "Unknown")
     suppliers = state.get("suppliers", [])
     edges = state.get("edges", [])
@@ -466,14 +482,19 @@ def format_report(state: GraphState) -> str:
     actions = state.get("workflow_actions", [])
     trace = state.get("workflow_trace", [])
 
+    try:
+        reference_set = load_reference_set()
+    except Exception:
+        reference_set = None
+
     lines: list[str] = [
-        f"Supply-Chain Risk Report: {company}",
-        "=" * 50,
+        f"Supplier Multi-Hazard Exposure Index (SMHEI) Report: {company}",
+        "=" * 60,
         "",
     ]
 
     # Executive Summary
-    lines += _build_executive_summary(company, suppliers, summary)
+    lines += _build_executive_summary(company, suppliers, summary, reference_set=reference_set)
 
     # Company Profile (from LLM entity resolution)
     company_profile = state.get("company_profile", {})
@@ -528,8 +549,8 @@ def format_report(state: GraphState) -> str:
     if trace:
         lines.append(f"  Trace: {' -> '.join(trace)}")
     if summary:
-        lines.append(f"  Company risk score: {summary.get('company_score', 0.0):.4f}")
-        lines.append(f"  Risk band: {summary.get('risk_band', 'unknown')}")
+        lines.append(f"  Company exposure index (mean E_s): {summary.get('company_score', 0.0):.4f}")
+        lines.append(f"  Company exposure band: {summary.get('company_band', summary.get('risk_band', 'unknown'))}")
     if decision:
         lines.append(f"  Decision route: {decision.get('route', 'unknown')}")
         lines.append(f"  Decision reason: {decision.get('reason', 'n/a')}")
@@ -549,19 +570,25 @@ def format_report(state: GraphState) -> str:
         ),
     ]
 
-    # Supplier Risk Ranking (enriched with industry/location/evidence)
+    # Supplier SMHEI Ranking
     supplier_risks = summary.get("supplier_risks", [])
     supplier_map = {s["name"]: s for s in suppliers}
     if supplier_risks:
         lines.append("")
-        lines.append("--- Supplier Risk Ranking ---")
+        lines.append("--- Supplier Multi-Hazard Exposure Index (SMHEI) Ranking ---")
+        lines.append("  (E_s = exposure_index, M_s = exposure_max, dominant = dominant_hazard)")
         for item in supplier_risks:
             name = item["supplier_name"]
             info = supplier_map.get(name, {})
             ev_source = info.get("evidence_source", "")
+            E_s = item.get("exposure_index", item.get("risk_score", 0.0))
+            M_s = item.get("exposure_max", 0.0)
+            dominant = item.get("dominant_hazard", "?")
+            band = item.get("exposure_band", item.get("risk_band", "?"))
             line = (
-                f"  {name}: risk={item['risk_score']:.4f}, "
-                f"tier={item['tier']}, confidence={item['confidence']:.2f}"
+                f"  {name}: E_s={E_s:.4f}, M_s={M_s:.4f}, "
+                f"dominant={dominant}, band={band}, "
+                f"tier={item['tier']}, conf={item['confidence']:.2f}"
             )
             if ev_source:
                 line += f", source={ev_source}"
@@ -578,38 +605,54 @@ def format_report(state: GraphState) -> str:
             if extras:
                 line += f", {', '.join(extras)}"
             lines.append(line)
-            # Show verification URL for web-verified suppliers.
             verification_url = info.get("verification_url", "")
             if verification_url:
                 lines.append(f"    Verified: {verification_url}")
 
-    # Threshold Alerts (unchanged)
-    hazard_alerts = summary.get("hazard_alerts", [])
-    if hazard_alerts:
-        lines.append("")
-        lines.append("--- Threshold Alerts ---")
-        for alert in hazard_alerts:
-            lines.append(
-                "  "
-                f"{alert['supplier_name']} / {alert['hazard_type']}: "
-                f"{alert['score']:.4f} (threshold {alert['threshold']:.2f}, "
-                f"exceedance {alert['exceedance']:.4f})"
-            )
-
-    # Risk Register Matrix (new)
+    # Risk Register Matrix
     lines += _build_risk_register_matrix(suppliers, hazards)
 
-    # Hazard Summary (unchanged)
+    # Hazard Summary
+    _HAZARD_LABELS = {
+        "earthquake": "Seismic (GEM 2023 PGA, 475-yr RP)",
+        "flood": "River Flood (WRI Aqueduct 100-yr depth, 0.01° grid)",
+        "wildfire": "Approx. FWI Q95 (daily ERA5 stats proxy; Van Wagner 1987)",
+        "cyclone": "Cyclone V_100 km/h (STORM 100-yr RP; Bloemendaal et al. 2020)",
+        "heat_stress": "Apparent Heat Stress (apparent_temperature_max >= 32°C, ERA5 1991-2020)",
+        "drought": "Drought (SPEI-12 fraction months <= -1; Vicente-Serrano et al. 2010)",
+    }
     lines += [
         "",
         "--- Hazard Summary ---",
+        "  Raw value = physical indicator; H = percentile rank (0-1 relative to reference corpus)",
     ]
     for h in hazards:
         s100 = h.get("score_100", round(h["score"] * 100))
         lvl = h.get("level", "")
+        raw = h.get("raw_value", "?")
+        raw_str = f"{raw:.4f}" if isinstance(raw, float) else str(raw)
+        label = _HAZARD_LABELS.get(h["hazard_type"], h["hazard_type"])
         lines.append(
-            f"  {h['supplier_name']}: {h['hazard_type']} = {s100}/100 ({lvl})"
+            f"  {h['supplier_name']}: {label} | raw={raw_str}, H={h['score']:.4f}, {s100}/100 ({lvl})"
         )
+
+    # Heat note (canonical sentence)
+    lines.append("")
+    lines.append(
+        "  Heat note: Heat exposure is defined as the fraction of days with "
+        "apparent_temperature_max >= 32°C over 1991-2020, derived from Open-Meteo ERA5. "
+        "The 32°C value is used as an operational screening threshold in this study; "
+        "it is not presented as a universal biological cutoff. "
+        "Gasparrini et al. (2015) is cited for general heat-health context only."
+    )
+    lines.append(
+        "  Wildfire note: FWI is computed from ERA5 daily statistics "
+        "(temperature_2m_max, relative_humidity_2m_min, wind_speed_10m_max, "
+        "precipitation_sum) via the Van Wagner (1987) recurrence formulas. "
+        "This is an approximation of the standard Canadian FWI workflow, which "
+        "requires noon-condition observations. Strict FWI benchmarks are not "
+        "applicable to this computation."
+    )
 
     # Mitigations (LLM first, deterministic fallback)
     lines += _build_mitigations(state)

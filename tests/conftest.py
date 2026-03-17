@@ -11,6 +11,47 @@ import pytest
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
+# ---------------------------------------------------------------------------
+# Mock reference set (autouse) — avoids needing data/reference_set.json
+# ---------------------------------------------------------------------------
+
+_MOCK_REFERENCE_SET = {
+    "metadata": {
+        "built_at": "2024-01-01T00:00:00+00:00",
+        "n_suppliers": 50,
+        "source": "build_reference_set.py",
+        "corpus": "study-specific: supplier locations for benchmark companies",
+        "non_informative_hazards": [],
+    },
+    "hazards": {
+        "earthquake": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+        "flood":      [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+        "wildfire":   [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0],
+        "cyclone":    [0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0, 200.0],
+        "heat_stress":[0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50],
+        "drought":    [0.0, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20],
+    },
+    "supplier_exposure_thresholds": {"medium": 0.33, "high": 0.67},
+    "company_exposure_thresholds": {"medium": 0.35, "high": 0.65},
+}
+
+
+@pytest.fixture(autouse=True)
+def mock_reference_set():
+    """Patch load_reference_set to return a deterministic mock.
+
+    Avoids needing data/reference_set.json to exist during tests.
+    Patches both bor_risk.utils and bor_risk.tools (which does a from-import).
+    Tests that specifically test load_reference_set must override this fixture.
+    """
+    from bor_risk import utils as utils_module
+    from bor_risk import tools as tools_module
+    utils_module.load_reference_set.cache_clear()
+    with patch.object(utils_module, "load_reference_set", return_value=_MOCK_REFERENCE_SET):
+        with patch.object(tools_module, "load_reference_set", return_value=_MOCK_REFERENCE_SET):
+            yield
+    utils_module.load_reference_set.cache_clear()
+
 
 @pytest.fixture()
 def mock_suppliers() -> list[dict]:

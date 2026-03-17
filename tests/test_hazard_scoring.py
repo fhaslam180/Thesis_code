@@ -1,17 +1,14 @@
-"""Tests for hazard scoring across all hazard types."""
+"""Tests for hazard scoring across all hazard types (new SMHEI scorers)."""
 
 from __future__ import annotations
 
 import json
-import math
 from unittest.mock import patch
 
 import pytest
 
 from bor_risk.models import Supplier
 from bor_risk.tools import _normalize_score, compute_hazard
-
-from conftest import _make_mock_response
 
 
 def _make_supplier(
@@ -20,18 +17,9 @@ def _make_supplier(
     lon: float = 0.0,
 ) -> Supplier:
     return Supplier(
-        name=name,
-        lat=lat,
-        lon=lon,
-        tier=1,
-        confidence=0.8,
-        evidence_ids=["E_TEST"],
+        name=name, lat=lat, lon=lon,
+        tier=1, confidence=0.8, evidence_ids=["E_TEST"],
     )
-
-
-def _mock_urlopen_count(count: int):
-    """Return a side_effect that always returns *count* for any URL."""
-    return lambda url, *a, **kw: _make_mock_response(str(count).encode())
 
 
 # -------------------------------------------------------------------
@@ -40,319 +28,208 @@ def _mock_urlopen_count(count: int):
 
 
 class TestNormalizeScore:
-    """Tests for the _normalize_score helper."""
-
-    def test_zero(self) -> None:
+    def test_zero(self):
         assert _normalize_score(0.0) == (0, "Low")
 
-    def test_low_boundary(self) -> None:
+    def test_low_boundary(self):
         assert _normalize_score(0.33) == (33, "Low")
 
-    def test_medium_start(self) -> None:
+    def test_medium_start(self):
         assert _normalize_score(0.34) == (34, "Medium")
 
-    def test_medium_boundary(self) -> None:
+    def test_medium_boundary(self):
         assert _normalize_score(0.66) == (66, "Medium")
 
-    def test_high_start(self) -> None:
+    def test_high_start(self):
         assert _normalize_score(0.67) == (67, "High")
 
-    def test_max(self) -> None:
+    def test_max(self):
         assert _normalize_score(1.0) == (100, "High")
 
-    def test_mid_value(self) -> None:
-        score_100, level = _normalize_score(0.5)
-        assert score_100 == 50
+    def test_mid_value(self):
+        s100, level = _normalize_score(0.5)
+        assert s100 == 50
         assert level == "Medium"
 
 
 # -------------------------------------------------------------------
-# USGS earthquake scoring tests
+# Earthquake scoring (GEM 2023 PGA, SQLite)
 # -------------------------------------------------------------------
 
 
-class TestUSGSEarthquakeScoring:
-    """Tests for earthquake scoring via the USGS API (mocked)."""
+class TestEarthquakeScoring:
+    """Earthquake scorer returns 0.0 when DB is absent (logged warning)."""
 
-    def test_earthquake_uses_usgs_metadata(self) -> None:
+    def test_returns_valid_hazard_score(self):
         score = compute_hazard(_make_supplier(), hazard_type="earthquake")
-        assert score.dataset_metadata["dataset"] == "usgs_earthquake_catalog"
-        assert score.dataset_metadata["method"] == "usgs_fdsnws_count"
-
-    def test_has_score_100_and_level(self) -> None:
-        score = compute_hazard(_make_supplier(), hazard_type="earthquake")
+        assert score.supplier_name == "TestCorp"
+        assert 0.0 <= score.score <= 1.0
         assert 0 <= score.score_100 <= 100
         assert score.level in ("Low", "Medium", "High")
 
-    def test_zero_count_gives_zero_score(self, mock_urlopen) -> None:
-        mock_urlopen.side_effect = _mock_urlopen_count(0)
+    def test_raw_value_field_present(self):
         score = compute_hazard(_make_supplier(), hazard_type="earthquake")
-        assert score.score == 0.0
-        assert score.score_100 == 0
-        assert score.level == "Low"
+        assert hasattr(score, "raw_value")
+        assert isinstance(score.raw_value, float)
 
-    def test_high_count_gives_max_score(self, mock_urlopen) -> None:
-        mock_urlopen.side_effect = _mock_urlopen_count(5000)
-        score = compute_hazard(
-            _make_supplier("TokyoCo", lat=35.67, lon=139.65),
-            hazard_type="earthquake",
-        )
-        assert score.score == 1.0
-        assert score.score_100 == 100
-        assert score.level == "High"
-
-    def test_moderate_count_gives_mid_score(self, mock_urlopen) -> None:
-        mock_urlopen.side_effect = _mock_urlopen_count(46)
-        score = compute_hazard(
-            _make_supplier("SFCo", lat=37.77, lon=-122.42),
-            hazard_type="earthquake",
-        )
-        expected = round(min(1.0, math.log10(1 + 46) / 3.5), 4)
-        assert score.score == expected
-
-    def test_passes_correct_lat_lon_to_api(self, mock_urlopen) -> None:
-        supplier = _make_supplier("GeoTest", lat=51.51, lon=-0.13)
-        compute_hazard(supplier, hazard_type="earthquake")
-        url = mock_urlopen.call_args[0][0]
-        assert "latitude=51.51" in url
-        assert "longitude=-0.13" in url
-
-    def test_api_failure_returns_zero_score(self) -> None:
-        """If USGS API fails, score should default to 0."""
-        import urllib.error
-
-        with patch(
-            "urllib.request.urlopen",
-            side_effect=urllib.error.URLError("network down"),
-        ):
-            score = compute_hazard(_make_supplier(), hazard_type="earthquake")
-        assert score.score == 0.0
-        assert score.score_100 == 0
-
-    def test_earthquake_count_in_metadata(self, mock_urlopen) -> None:
-        mock_urlopen.side_effect = _mock_urlopen_count(46)
+    def test_dataset_metadata(self):
         score = compute_hazard(_make_supplier(), hazard_type="earthquake")
-        assert score.dataset_metadata["earthquake_count"] == 46
+        meta = score.dataset_metadata
+        assert meta["dataset"] == "GEM_2023"
+        assert meta["return_period_yr"] == 475
+        assert "source" in meta
+
+    def test_no_db_gives_zero_raw(self):
+        # DB absent → pga_g = 0.0 → percentile_rank(0.0, ref) = 0.0
+        score = compute_hazard(_make_supplier(), hazard_type="earthquake")
+        assert score.raw_value == 0.0
+        assert score.score == 0.0
 
 
 # -------------------------------------------------------------------
-# Flood scoring tests (Open-Meteo GloFAS)
+# Flood scoring (WRI Aqueduct, SQLite, 0.01° grid)
 # -------------------------------------------------------------------
 
 
 class TestFloodScoring:
-    """Tests for flood scoring via the Open-Meteo GloFAS API (mocked)."""
-
-    def test_returns_hazard_score(self) -> None:
+    def test_returns_valid_hazard_score(self):
         score = compute_hazard(_make_supplier(), hazard_type="flood")
         assert score.supplier_name == "TestCorp"
         assert 0.0 <= score.score <= 1.0
-        assert 0 <= score.score_100 <= 100
-        assert score.level in ("Low", "Medium", "High")
 
-    def test_dataset_metadata(self) -> None:
+    def test_dataset_metadata(self):
         score = compute_hazard(_make_supplier(), hazard_type="flood")
-        assert score.dataset_metadata["dataset"] == "glofas_river_discharge"
-        assert score.dataset_metadata["method"] == "open_meteo_flood_api"
-        assert "mean_discharge_m3s" in score.dataset_metadata
-        assert "days_above_2x_mean" in score.dataset_metadata
+        meta = score.dataset_metadata
+        assert meta["dataset"] == "Aqueduct_Floods"
+        assert meta["return_period_yr"] == 100
+        assert meta["grid_resolution_deg"] == 0.01
+        assert "depth_m" in meta
 
-    def test_api_failure_returns_zero(self) -> None:
-        import urllib.error
-
-        with patch(
-            "urllib.request.urlopen",
-            side_effect=urllib.error.URLError("network down"),
-        ):
-            score = compute_hazard(_make_supplier(), hazard_type="flood")
-        assert score.score == 0.0
-        assert score.score_100 == 0
-
-    def test_no_discharge_gives_zero(self, mock_urlopen) -> None:
-        empty = json.dumps({"daily": {"river_discharge": []}}).encode()
-        mock_urlopen.side_effect = lambda url, *a, **kw: _make_mock_response(empty)
+    def test_no_db_gives_zero_raw(self):
         score = compute_hazard(_make_supplier(), hazard_type="flood")
-        assert score.score == 0.0
+        assert score.raw_value == 0.0
 
 
 # -------------------------------------------------------------------
-# Heat stress scoring tests (Open-Meteo ERA5)
+# Heat stress scoring (Open-Meteo ERA5, 32°C threshold)
 # -------------------------------------------------------------------
 
 
 class TestHeatStressScoring:
-    """Tests for heat stress scoring via Open-Meteo ERA5 (mocked)."""
-
-    def test_returns_hazard_score(self) -> None:
+    def test_returns_valid_hazard_score(self):
         score = compute_hazard(_make_supplier(), hazard_type="heat_stress")
         assert score.supplier_name == "TestCorp"
         assert 0.0 <= score.score <= 1.0
-        assert 0 <= score.score_100 <= 100
-        assert score.level in ("Low", "Medium", "High")
 
-    def test_dataset_metadata(self) -> None:
+    def test_dataset_metadata(self):
         score = compute_hazard(_make_supplier(), hazard_type="heat_stress")
-        assert score.dataset_metadata["dataset"] == "era5_reanalysis"
-        assert score.dataset_metadata["method"] == "open_meteo_historical_api"
-        assert score.dataset_metadata["extreme_heat_threshold_c"] == 35
+        meta = score.dataset_metadata
+        assert meta["dataset"] == "Open-Meteo ERA5"
+        assert meta["heat_metric"] == "apparent_temperature_max >= 32C"
+        assert "threshold_note" in meta
+        assert "metric_source" in meta
 
-    def test_no_extreme_days_gives_zero(self, mock_urlopen) -> None:
+    def test_no_extreme_days_gives_zero_fraction(self, mock_urlopen):
         cold = json.dumps({
             "daily": {"apparent_temperature_max": [10.0, 12.0, 8.0, 15.0]},
         }).encode()
+        from conftest import _make_mock_response
         mock_urlopen.side_effect = lambda url, *a, **kw: _make_mock_response(cold)
-        score = compute_hazard(_make_supplier(), hazard_type="heat_stress")
-        assert score.score == 0.0
+        # clear cache so fresh API call is made
+        from bor_risk import tools as t
+        t._api_cache.clear() if t._api_cache is not None else None
+        score = compute_hazard(_make_supplier(lat=99.0, lon=99.0), hazard_type="heat_stress")
+        assert score.raw_value == 0.0
 
-    def test_api_failure_returns_zero(self) -> None:
+    def test_api_failure_returns_zero(self):
         import urllib.error
-
-        with patch(
-            "urllib.request.urlopen",
-            side_effect=urllib.error.URLError("network down"),
-        ):
-            score = compute_hazard(_make_supplier(), hazard_type="heat_stress")
+        from bor_risk import tools as t
+        t._api_cache.clear() if t._api_cache is not None else None
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+            score = compute_hazard(_make_supplier(lat=88.0, lon=88.0), hazard_type="heat_stress")
+        assert score.raw_value == 0.0
         assert score.score == 0.0
 
 
 # -------------------------------------------------------------------
-# Drought scoring tests (Open-Meteo ERA5 precipitation)
+# Drought scoring (SPEI-12, ERA5)
 # -------------------------------------------------------------------
 
 
 class TestDroughtScoring:
-    """Tests for drought scoring via Open-Meteo ERA5 precipitation (mocked)."""
-
-    def test_returns_hazard_score(self) -> None:
+    def test_returns_valid_hazard_score(self):
         score = compute_hazard(_make_supplier(), hazard_type="drought")
         assert score.supplier_name == "TestCorp"
         assert 0.0 <= score.score <= 1.0
-        assert 0 <= score.score_100 <= 100
-        assert score.level in ("Low", "Medium", "High")
 
-    def test_dataset_metadata(self) -> None:
+    def test_dataset_metadata(self):
         score = compute_hazard(_make_supplier(), hazard_type="drought")
-        assert score.dataset_metadata["dataset"] == "era5_precipitation"
-        assert score.dataset_metadata["method"] == "dry_month_fraction"
-        assert "mean_monthly_precip_mm" in score.dataset_metadata
-        assert "dry_months" in score.dataset_metadata
+        meta = score.dataset_metadata
+        assert meta["dataset"] == "Open-Meteo ERA5"
+        assert meta["indicator"] == "SPEI-12"
+        assert "Vicente-Serrano" in meta["source"]
 
-    def test_api_failure_returns_zero(self) -> None:
+    def test_api_failure_returns_zero(self):
         import urllib.error
-
-        with patch(
-            "urllib.request.urlopen",
-            side_effect=urllib.error.URLError("network down"),
-        ):
-            score = compute_hazard(_make_supplier(), hazard_type="drought")
+        from bor_risk import tools as t
+        t._api_cache.clear() if t._api_cache is not None else None
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+            score = compute_hazard(_make_supplier(lat=77.0, lon=77.0), hazard_type="drought")
+        assert score.raw_value == 0.0
         assert score.score == 0.0
 
 
 # -------------------------------------------------------------------
-# Wildfire scoring tests (local FIRMS grid)
+# Wildfire scoring (Approx. FWI Q95, ERA5 daily stats)
 # -------------------------------------------------------------------
 
 
 class TestWildfireScoring:
-    """Tests for wildfire scoring via preprocessed NASA FIRMS grid."""
-
-    def test_returns_hazard_score(self) -> None:
-        score = compute_hazard(
-            _make_supplier("SFCo", lat=37.7749, lon=-122.4194),
-            hazard_type="wildfire",
-        )
-        assert score.supplier_name == "SFCo"
+    def test_returns_valid_hazard_score(self):
+        score = compute_hazard(_make_supplier(), hazard_type="wildfire")
+        assert score.supplier_name == "TestCorp"
         assert 0.0 <= score.score <= 1.0
-        assert 0 <= score.score_100 <= 100
-        assert score.level in ("Low", "Medium", "High")
 
-    def test_dataset_metadata(self) -> None:
-        score = compute_hazard(
-            _make_supplier("SFCo", lat=37.7749, lon=-122.4194),
-            hazard_type="wildfire",
-        )
-        assert score.dataset_metadata["dataset"] == "viirs_active_fire_annual"
-        assert score.dataset_metadata["method"] == "grid_cell_fire_count"
-        assert "fire_count" in score.dataset_metadata
+    def test_dataset_metadata(self):
+        score = compute_hazard(_make_supplier(), hazard_type="wildfire")
+        meta = score.dataset_metadata
+        assert meta["dataset"] == "Open-Meteo ERA5"
+        assert meta["fwi_computation"] == "daily_stats_approximation"
+        assert "Approx. FWI Q95" in meta["indicator"]
+        assert "Van Wagner" in meta["method"]
 
-    def test_no_fire_area_gives_zero(self) -> None:
-        score = compute_hazard(
-            _make_supplier("OceanCo", lat=0.0, lon=0.0),
-            hazard_type="wildfire",
-        )
+    def test_api_failure_returns_zero(self):
+        import urllib.error
+        from bor_risk import tools as t
+        t._api_cache.clear() if t._api_cache is not None else None
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+            score = compute_hazard(_make_supplier(lat=66.0, lon=66.0), hazard_type="wildfire")
+        assert score.raw_value == 0.0
         assert score.score == 0.0
-        assert score.score_100 == 0
-
-    def test_high_fire_area_gives_positive_score(self) -> None:
-        score = compute_hazard(
-            _make_supplier("LACo", lat=34.0, lon=-118.0),
-            hazard_type="wildfire",
-        )
-        assert score.score > 0.0
-        assert score.score_100 > 0
-
-    def test_formula_log_scaled(self) -> None:
-        score = compute_hazard(
-            _make_supplier("LACo", lat=34.0, lon=-118.0),
-            hazard_type="wildfire",
-        )
-        count = score.dataset_metadata["fire_count"]
-        expected = round(min(1.0, math.log10(1 + count) / 4.0), 4)
-        assert score.score == expected
 
 
 # -------------------------------------------------------------------
-# Cyclone scoring tests (local IBTrACS grid)
+# Cyclone scoring (STORM dataset, SQLite)
 # -------------------------------------------------------------------
 
 
 class TestCycloneScoring:
-    """Tests for cyclone scoring via preprocessed NOAA IBTrACS grid."""
-
-    def test_returns_hazard_score(self) -> None:
-        score = compute_hazard(
-            _make_supplier("ManilaCo", lat=14.0, lon=121.0),
-            hazard_type="cyclone",
-        )
-        assert score.supplier_name == "ManilaCo"
+    def test_returns_valid_hazard_score(self):
+        score = compute_hazard(_make_supplier(), hazard_type="cyclone")
+        assert score.supplier_name == "TestCorp"
         assert 0.0 <= score.score <= 1.0
-        assert 0 <= score.score_100 <= 100
 
-    def test_dataset_metadata(self) -> None:
-        score = compute_hazard(
-            _make_supplier("ManilaCo", lat=14.0, lon=121.0),
-            hazard_type="cyclone",
-        )
-        assert score.dataset_metadata["dataset"] == "ibtracs"
-        assert score.dataset_metadata["method"] == "grid_cell_storm_count"
-        assert "storm_count" in score.dataset_metadata
-        assert "max_wind_kt" in score.dataset_metadata
+    def test_dataset_metadata(self):
+        score = compute_hazard(_make_supplier(), hazard_type="cyclone")
+        meta = score.dataset_metadata
+        assert meta["dataset"] == "STORM_2020"
+        assert meta["return_period_yr"] == 100
+        assert "Bloemendaal" in meta["source"]
+        assert "v100_kmh" in meta
 
-    def test_no_cyclone_area_gives_zero(self) -> None:
-        score = compute_hazard(
-            _make_supplier("LondonCo", lat=52.0, lon=0.0),
-            hazard_type="cyclone",
-        )
-        assert score.score == 0.0
-        assert score.score_100 == 0
-
-    def test_high_cyclone_area_gives_high_score(self) -> None:
-        # Eastern Pacific (18,-112) has 73 storms in real IBTrACS data
-        score = compute_hazard(
-            _make_supplier("PacificCo", lat=18.0, lon=-112.0),
-            hazard_type="cyclone",
-        )
-        assert score.score > 0.5
-        assert score.level == "High"
-
-    def test_formula_linear_capped(self) -> None:
-        score = compute_hazard(
-            _make_supplier("ManilaCo", lat=14.0, lon=121.0),
-            hazard_type="cyclone",
-        )
-        count = score.dataset_metadata["storm_count"]
-        expected = round(min(1.0, count / 50.0), 4)
-        assert score.score == expected
+    def test_no_db_gives_zero_raw(self):
+        score = compute_hazard(_make_supplier(), hazard_type="cyclone")
+        assert score.raw_value == 0.0
 
 
 # -------------------------------------------------------------------
@@ -361,26 +238,23 @@ class TestCycloneScoring:
 
 
 class TestHashStubScoring:
-    """Tests for unknown hazard types that fall back to SHA-256 stub."""
-
-    def test_returns_hazard_score(self) -> None:
+    def test_returns_valid_hazard_score(self):
         score = compute_hazard(_make_supplier(), hazard_type="unknown_hazard")
         assert score.supplier_name == "TestCorp"
         assert 0.0 <= score.score <= 1.0
-        assert 0 <= score.score_100 <= 100
 
-    def test_dataset_metadata_populated(self) -> None:
+    def test_dataset_metadata_populated(self):
         score = compute_hazard(_make_supplier(), hazard_type="unknown_hazard")
         assert score.dataset_metadata["dataset"] == "stub_unknown_hazard_v1"
         assert score.dataset_metadata["method"] == "sha256_hash_stub"
 
-    def test_deterministic(self) -> None:
+    def test_deterministic(self):
         s = _make_supplier("DeterministicCo")
         a = compute_hazard(s, "unknown_hazard")
         b = compute_hazard(s, "unknown_hazard")
         assert a.score == b.score
 
-    def test_different_hazard_types_differ(self) -> None:
+    def test_different_hazard_types_differ(self):
         s = _make_supplier()
         a = compute_hazard(s, "unknown_a")
         b = compute_hazard(s, "unknown_b")
