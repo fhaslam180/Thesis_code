@@ -1,5 +1,6 @@
 """Tests for claim verification and evidence-source weighting."""
 
+import pytest
 from unittest.mock import patch
 
 from bor_risk.budget import BudgetTracker
@@ -26,7 +27,7 @@ class TestVerifySuppliersBatch:
     def test_verifies_in_descending_confidence(self):
         """Pipeline verifies highest-confidence suppliers first."""
         suppliers = self._make_suppliers()
-        budget = BudgetTracker(max_web_queries=1)  # Only 1 query allowed
+        budget = BudgetTracker()
         call_order = []
 
         def mock_search(query, **kwargs):
@@ -39,21 +40,8 @@ class TestVerifySuppliersBatch:
             )
 
         # Should have tried to verify HighConf first (highest confidence).
-        assert len(call_order) == 1
+        assert len(call_order) >= 1
         assert "HighConf" in call_order[0]
-
-    def test_stops_when_budget_exhausted(self):
-        """Pipeline stops verification when web budget runs out."""
-        suppliers = self._make_suppliers()
-        budget = BudgetTracker(max_web_queries=2)
-
-        with patch("bor_risk.search.search_web_snapshot", return_value=[]):
-            updated, evidence = verify_suppliers_batch(
-                suppliers, "TestCo", budget, snapshot_mode=True
-            )
-
-        assert budget.web_queries == 2
-        assert budget.web_budget_remaining == 0
 
     def test_upgrades_on_co_mention(self):
         """Verification upgrades evidence_source when co-mention found."""
@@ -61,7 +49,7 @@ class TestVerifySuppliersBatch:
             {"name": "TSMC", "lat": 24.8, "lon": 121.0, "tier": 1,
              "confidence": 0.8, "evidence_source": "llm_only"},
         ]
-        budget = BudgetTracker(max_web_queries=5)
+        budget = BudgetTracker()
 
         mock_results = [
             {"title": "Apple suppliers",
@@ -87,7 +75,7 @@ class TestVerifySuppliersBatch:
             {"name": "TSMC", "lat": 24.8, "lon": 121.0, "tier": 1,
              "confidence": 0.8, "evidence_source": "llm_only"},
         ]
-        budget = BudgetTracker(max_web_queries=5)
+        budget = BudgetTracker()
 
         # Content mentions TSMC but not Apple.
         mock_results = [
@@ -144,8 +132,6 @@ class TestEvidenceSourceWeighting:
         assert "exposure_band" in risk
         assert "dominant_hazard" in risk
 
-import pytest
-
 
 # ---------------------------------------------------------------------------
 # New: verify_claim_against_evidence unit tests
@@ -171,56 +157,33 @@ class TestVerifyClaimAgainstEvidence:
     """Unit tests for verify_claim_against_evidence (heuristic path)."""
 
     def test_co_mention_missing_returns_unknown(self):
-        """Company not in evidence text → UNKNOWN verdict."""
+        """Company not in evidence text → UNKNOWN verdict (Stage 1)."""
         claim = _make_claim("Apple", "TSMC")
         # Text mentions TSMC but not Apple.
         evidence = "TSMC is a major semiconductor manufacturer based in Taiwan."
-        budget = BudgetTracker(max_llm_calls=0)  # exhausted: heuristic path
 
-        result = verify_claim_against_evidence(claim, evidence, budget)
+        result = verify_claim_against_evidence(claim, evidence, budget=None)
         assert result.verdict == "UNKNOWN"
 
     def test_supplier_missing_returns_unknown(self):
-        """Supplier not in evidence text → UNKNOWN verdict."""
+        """Supplier not in evidence text → UNKNOWN verdict (Stage 1)."""
         claim = _make_claim("Apple", "TSMC")
         # Text mentions Apple but not TSMC.
         evidence = "Apple is a major technology company headquartered in Cupertino."
-        budget = BudgetTracker(max_llm_calls=0)
 
-        result = verify_claim_against_evidence(claim, evidence, budget)
+        result = verify_claim_against_evidence(claim, evidence, budget=None)
         assert result.verdict == "UNKNOWN"
 
-    def test_negation_returns_disputed(self):
-        """Termination/dispute language → DISPUTED verdict."""
+    def test_termination_language_stage1(self):
+        """Termination/dispute language → DISPUTED verdict (Stage 1)."""
         claim = _make_claim("Apple", "TSMC")
         evidence = (
             "Apple has no longer relied on TSMC as a supplier and "
             "has terminated the relationship."
         )
-        budget = BudgetTracker(max_llm_calls=0)
 
-        result = verify_claim_against_evidence(claim, evidence, budget)
+        result = verify_claim_against_evidence(claim, evidence, budget=None)
         assert result.verdict == "DISPUTED"
-
-    def test_relationship_cue_with_exhausted_budget(self):
-        """Co-mention + relationship cue + no LLM budget → SUPPORTED (heuristic)."""
-        claim = _make_claim("Apple", "TSMC")
-        # Contains co-mention AND a relationship cue word ("supplier")
-        evidence = "Apple uses TSMC as a key supplier for A-series chips."
-        budget = BudgetTracker(max_llm_calls=0)  # budget exhausted
-
-        result = verify_claim_against_evidence(claim, evidence, budget)
-        assert result.verdict == "SUPPORTED"
-
-    def test_no_relationship_cue_with_exhausted_budget(self):
-        """Co-mention without relationship cue + no LLM budget → WEAK (heuristic)."""
-        claim = _make_claim("Apple", "TSMC")
-        # Contains co-mention but NO relationship cue word
-        evidence = "Both Apple and TSMC are major technology companies."
-        budget = BudgetTracker(max_llm_calls=0)  # budget exhausted
-
-        result = verify_claim_against_evidence(claim, evidence, budget)
-        assert result.verdict == "WEAK"
 
     def test_substring_guard_with_mocked_llm(self):
         """Stage 3: LLM returns SUPPORTED with non-verbatim quote → downgrade to WEAK."""
@@ -229,7 +192,7 @@ class TestVerifyClaimAgainstEvidence:
 
         claim = _make_claim("Apple", "TSMC")
         evidence = "Apple relies on TSMC as a key supplier for semiconductors."
-        budget = BudgetTracker(max_llm_calls=10)
+        budget = BudgetTracker()
 
         # LLM returns SUPPORTED but with a quote NOT in the evidence text
         fake_verdict = VerificationVerdict(
@@ -256,7 +219,7 @@ class TestVerifyClaimAgainstEvidence:
 
         claim = _make_claim("Apple", "TSMC")
         evidence = "Apple relies on TSMC as a key supplier for semiconductors."
-        budget = BudgetTracker(max_llm_calls=10)
+        budget = BudgetTracker()
 
         # LLM returns SUPPORTED with a quote that IS verbatim in the evidence
         verbatim_quote = "TSMC as a key supplier"

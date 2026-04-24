@@ -393,27 +393,6 @@ def _build_evidence_source_summary(suppliers: list[dict]) -> list[str]:
     return lines
 
 
-def _build_budget_summary(state: GraphState) -> list[str]:
-    """Budget usage section."""
-    budget = state.get("budget_summary", {})
-    if not budget:
-        return []
-
-    lines = ["", "--- Budget Summary ---"]
-    llm_calls = budget.get("llm_calls", 0)
-    max_llm = budget.get("max_llm_calls", 0)
-    web_queries = budget.get("web_queries", 0)
-    max_web = budget.get("max_web_queries", 0)
-    hazard_scores = budget.get("hazard_scores", 0)
-    wall_clock = budget.get("wall_clock_seconds", 0)
-
-    lines.append(f"  LLM calls: {llm_calls} / {max_llm}")
-    lines.append(f"  Web queries: {web_queries} / {max_web}")
-    lines.append(f"  Hazard scores: {hazard_scores}")
-    lines.append(f"  Wall clock: {wall_clock:.1f}s")
-    return lines
-
-
 def _build_claim_summary(state: GraphState) -> list[str]:
     """Verified Claim Graph summary: verdict breakdown + supporting quotes."""
     claims = state.get("claims", [])
@@ -662,9 +641,6 @@ def format_report(state: GraphState) -> str:
 
     # Evidence Appendix (enhanced)
     lines += _build_evidence_appendix(evidence, hazards)
-
-    # Budget Summary
-    lines += _build_budget_summary(state)
 
     # IEEE References
     lines += _build_ieee_references(hazards)

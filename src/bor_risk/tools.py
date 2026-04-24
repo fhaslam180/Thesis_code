@@ -1,7 +1,8 @@
 """Deterministic hazard-scoring tools and LLM-based supplier discovery.
 
 Hazard scores come from computation, never from an LLM.
-Supplier discovery uses GPT-4o with structured output.
+LLM-backed steps use an environment-configurable chat model with structured
+output support. Default: gpt-4.1-mini.
 """
 
 from __future__ import annotations
@@ -10,10 +11,12 @@ import hashlib
 import json
 import logging
 import math
+import os as _os
 import re
 import sqlite3
 import ssl
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -48,6 +51,22 @@ _DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
 # Ensure OPENAI_API_KEY from .env is available for non-CLI code paths too.
 load_dotenv()
+
+_DEFAULT_LLM_MODEL = _os.getenv("BOR_RISK_LLM_MODEL", "gpt-4.1-mini")
+
+
+def _make_llm(*, temperature: float = 0, timeout: int = 60, max_retries: int = 5) -> ChatOpenAI:
+    """Create the default chat model used by the pipeline.
+
+    The model is controlled by BOR_RISK_LLM_MODEL so development and smoke tests
+    can use a cheaper model than final evaluation runs.
+    """
+    return ChatOpenAI(
+        model=_DEFAULT_LLM_MODEL,
+        temperature=temperature,
+        timeout=timeout,
+        max_retries=max_retries,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -98,23 +117,38 @@ def _build_hazard_score(
 
 
 def _urlopen_with_ssl_fallback(url: str, timeout: int = 15) -> bytes:
-    """Fetch URL content, retrying with unverified SSL on cert errors.
+    """Fetch URL content, retrying with unverified SSL on cert errors and 429 backoff.
 
     Some local environments (e.g. macOS) fail CA verification for
     certain HTTPS endpoints.  When that happens, retry once with an
     unverified context so the agent still returns real data.
-    Re-raises non-SSL errors so callers can apply their own fallback.
+    HTTP 429 responses are retried with exponential backoff (5, 10, 20 seconds).
+    Re-raises non-SSL, non-429 errors so callers can apply their own fallback.
     """
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return resp.read()
-    except urllib.error.URLError as e:
-        reason = getattr(e, "reason", None)
-        if isinstance(reason, ssl.SSLCertVerificationError):
-            ctx = ssl._create_unverified_context()
-            with urllib.request.urlopen(url, timeout=timeout, context=ctx) as resp:
+    import time as _time
+    max_attempts = 4
+    for attempt in range(max_attempts):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
                 return resp.read()
-        raise
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < max_attempts - 1:
+                delay = 5 * (2 ** attempt)  # 5, 10, 20 seconds
+                logger.warning(
+                    "Rate limited (429); retrying in %ds (%d/%d)",
+                    delay, attempt + 1, max_attempts - 1,
+                )
+                _time.sleep(delay)
+                continue
+            raise
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", None)
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                ctx = ssl._create_unverified_context()
+                with urllib.request.urlopen(url, timeout=timeout, context=ctx) as resp:
+                    return resp.read()
+            raise
+    raise RuntimeError("Unreachable")
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +192,20 @@ _API_CACHE_PATH = _DATA_DIR / "api_hazard_cache.json"
 _api_cache_lock = threading.Lock()
 _api_cache: dict[str, float] | None = None   # loaded lazily
 
+_OPEN_METEO_MIN_INTERVAL: float = float(_os.environ.get("OPEN_METEO_MIN_INTERVAL", "1.0"))
+_open_meteo_ratelimit_lock = threading.Lock()
+_open_meteo_last_t: float = 0.0
+
+
+def _open_meteo_rate_limit() -> None:
+    global _open_meteo_last_t
+    with _open_meteo_ratelimit_lock:
+        now = time.monotonic()
+        wait = _OPEN_METEO_MIN_INTERVAL - (now - _open_meteo_last_t)
+        if wait > 0:
+            time.sleep(wait)
+        _open_meteo_last_t = time.monotonic()
+
 
 def _get_api_cache() -> dict[str, float]:
     global _api_cache
@@ -175,12 +223,16 @@ def _get_api_cache() -> dict[str, float]:
 
 
 def _api_cache_lookup(hazard: str, lat: float, lon: float, method_version: str) -> float | None:
-    key = f"{hazard}|{lat}|{lon}|1991-2020|{method_version}"
+    lat_k = grid_key(lat, 1)
+    lon_k = grid_key(lon, 1)
+    key = f"{hazard}|{lat_k}|{lon_k}|1991-2020|{method_version}"
     return _get_api_cache().get(key)
 
 
 def _api_cache_store(hazard: str, lat: float, lon: float, method_version: str, value: float) -> None:
-    key = f"{hazard}|{lat}|{lon}|1991-2020|{method_version}"
+    lat_k = grid_key(lat, 1)
+    lon_k = grid_key(lon, 1)
+    key = f"{hazard}|{lat_k}|{lon_k}|1991-2020|{method_version}"
     cache = _get_api_cache()
     with _api_cache_lock:
         cache[key] = value
@@ -219,7 +271,7 @@ def _score_earthquake(supplier: Supplier) -> HazardScore:
     else:
         pga_g = _db_lookup(_GEM_DB, grid_key(supplier.lat, 1), grid_key(supplier.lon, 1))
     ref = load_reference_set()["hazards"]["earthquake"]
-    if ref[0] == ref[-1]:
+    if not ref or ref[0] == ref[-1]:
         logger.warning("Earthquake reference array is constant (non-informative)")
     h = percentile_rank(pga_g, ref)
     return _build_hazard_score(
@@ -247,7 +299,7 @@ def _score_flood(supplier: Supplier) -> HazardScore:
     else:
         depth_m = _db_lookup(_FLOOD_DB, grid_key(supplier.lat, 2), grid_key(supplier.lon, 2))
     ref = load_reference_set()["hazards"]["flood"]
-    if ref[0] == ref[-1]:
+    if not ref or ref[0] == ref[-1]:
         logger.warning("Flood reference array is constant (non-informative)")
     h = percentile_rank(depth_m, ref)
     return _build_hazard_score(
@@ -271,7 +323,7 @@ def _score_flood(supplier: Supplier) -> HazardScore:
 _HEAT_METHOD_VERSION = "apparent_temp_32_v1"
 
 
-def _fetch_heat_fraction(lat: float, lon: float) -> float:
+def _fetch_heat_fraction(lat: float, lon: float, _strict: bool = False) -> float:
     """Fraction of days with apparent_temperature_max >= 32 deg C (1991-2020).
 
     Heat exposure is defined as the fraction of days with apparent_temperature_max
@@ -279,14 +331,21 @@ def _fetch_heat_fraction(lat: float, lon: float) -> float:
     is used as an operational screening threshold in this study; it is not
     presented as a universal biological cutoff. Gasparrini et al. (2015) is
     cited for general heat-health context only. NOT UTCI.
+
+    _strict=True is used by the reference-set builder: API errors raise RuntimeError
+    rather than silently returning 0.0, so failed fetches are never accepted as
+    valid zero-exposure values in the reference corpus.
     """
     cached = _api_cache_lookup("heat_stress", lat, lon, _HEAT_METHOD_VERSION)
     if cached is not None:
         return cached
 
+    _open_meteo_rate_limit()
+    lat_r = grid_key(lat, 1) / 10.0
+    lon_r = grid_key(lon, 1) / 10.0
     url = (
         "https://archive-api.open-meteo.com/v1/archive"
-        f"?latitude={lat}&longitude={lon}"
+        f"?latitude={lat_r}&longitude={lon_r}"
         "&daily=apparent_temperature_max"
         "&start_date=1991-01-01&end_date=2020-12-31&timezone=UTC"
     )
@@ -294,11 +353,22 @@ def _fetch_heat_fraction(lat: float, lon: float) -> float:
         raw = _urlopen_with_ssl_fallback(url, timeout=30)
         data = json.loads(raw.decode())
     except (urllib.error.URLError, ValueError, OSError) as e:
+        if _strict:
+            raise RuntimeError(
+                f"heat_stress API call failed for ({lat:.4f}, {lon:.4f}): {e}. "
+                "Reference-set build requires a successful fetch; transient failures "
+                "must not silently produce zero-exposure values in the corpus."
+            )
         logger.warning("heat_stress API call failed for (%.4f, %.4f): %s", lat, lon, e)
         return 0.0
 
     values = [v for v in data.get("daily", {}).get("apparent_temperature_max", []) if v is not None]
     if not values:
+        if _strict:
+            raise RuntimeError(
+                f"heat_stress API returned no values for ({lat:.4f}, {lon:.4f}). "
+                "Reference-set build requires non-empty data."
+            )
         return 0.0
 
     fraction = sum(1 for v in values if v >= 32.0) / len(values)
@@ -310,7 +380,7 @@ def _score_heat_stress(supplier: Supplier) -> HazardScore:
     fraction = _fetch_heat_fraction(supplier.lat, supplier.lon)
     fraction = _guard_raw("heat_stress", supplier.name, supplier.lat, supplier.lon, fraction)
     ref = load_reference_set()["hazards"]["heat_stress"]
-    if ref[0] == ref[-1]:
+    if not ref or ref[0] == ref[-1]:
         logger.warning("Heat stress reference array is constant (non-informative)")
     h = percentile_rank(fraction, ref)
     return _build_hazard_score(
@@ -381,15 +451,22 @@ def _compute_spei12_fraction(monthly_precip_mm: list[float], monthly_et0_mm: lis
     return drought_months / len(spei)
 
 
-def _fetch_spei12_fraction(lat: float, lon: float) -> float:
-    """Fetch ERA5 precip + ET0 via Open-Meteo and compute SPEI-12 fraction."""
+def _fetch_spei12_fraction(lat: float, lon: float, _strict: bool = False) -> float:
+    """Fetch ERA5 precip + ET0 via Open-Meteo and compute SPEI-12 fraction.
+
+    _strict=True is used by the reference-set builder: API errors and SPEI
+    computation failures raise RuntimeError rather than silently returning 0.0.
+    """
     cached = _api_cache_lookup("drought", lat, lon, _DROUGHT_METHOD_VERSION)
     if cached is not None:
         return cached
 
+    _open_meteo_rate_limit()
+    lat_r = grid_key(lat, 1) / 10.0
+    lon_r = grid_key(lon, 1) / 10.0
     url = (
         "https://archive-api.open-meteo.com/v1/archive"
-        f"?latitude={lat}&longitude={lon}"
+        f"?latitude={lat_r}&longitude={lon_r}"
         "&daily=precipitation_sum,et0_fao_evapotranspiration"
         "&start_date=1991-01-01&end_date=2020-12-31&timezone=UTC"
     )
@@ -397,6 +474,11 @@ def _fetch_spei12_fraction(lat: float, lon: float) -> float:
         raw = _urlopen_with_ssl_fallback(url, timeout=30)
         data = json.loads(raw.decode())
     except (urllib.error.URLError, ValueError, OSError) as e:
+        if _strict:
+            raise RuntimeError(
+                f"drought API call failed for ({lat:.4f}, {lon:.4f}): {e}. "
+                "Reference-set build requires a successful fetch."
+            )
         logger.warning("drought API call failed for (%.4f, %.4f): %s", lat, lon, e)
         return 0.0
 
@@ -422,6 +504,11 @@ def _fetch_spei12_fraction(lat: float, lon: float) -> float:
     try:
         fraction = _compute_spei12_fraction(p_list, e_list)
     except ValueError as e:
+        if _strict:
+            raise RuntimeError(
+                f"SPEI-12 computation failed for ({lat:.4f}, {lon:.4f}): {e}. "
+                "Reference-set build requires a successful SPEI computation."
+            )
         logger.warning("SPEI-12 computation failed for (%.4f, %.4f): %s; using 0.0", lat, lon, e)
         return 0.0
 
@@ -433,7 +520,7 @@ def _score_drought(supplier: Supplier) -> HazardScore:
     fraction = _fetch_spei12_fraction(supplier.lat, supplier.lon)
     fraction = _guard_raw("drought", supplier.name, supplier.lat, supplier.lon, fraction)
     ref = load_reference_set()["hazards"]["drought"]
-    if ref[0] == ref[-1]:
+    if not ref or ref[0] == ref[-1]:
         logger.warning("Drought reference array is constant (non-informative)")
     h = percentile_rank(fraction, ref)
     return _build_hazard_score(
@@ -584,20 +671,26 @@ def _compute_fwi_series(
     return fwi_series
 
 
-def _fetch_approx_fwi_q95(lat: float, lon: float) -> float:
+def _fetch_approx_fwi_q95(lat: float, lon: float, _strict: bool = False) -> float:
     """Q95 of approximate daily FWI series (1991-2020) from ERA5 via Open-Meteo.
 
     Label: 'Approx. FWI Q95 (daily ERA5 stats proxy)'
     Thesis: FWI is computed from ERA5 daily statistics via Van Wagner (1987) recurrences.
     This is an approximation; noon-condition observations are not available.
+
+    _strict=True is used by the reference-set builder: API errors raise RuntimeError
+    rather than silently returning 0.0.
     """
     cached = _api_cache_lookup("wildfire", lat, lon, _WILDFIRE_METHOD_VERSION)
     if cached is not None:
         return cached
 
+    _open_meteo_rate_limit()
+    lat_r = grid_key(lat, 1) / 10.0
+    lon_r = grid_key(lon, 1) / 10.0
     url = (
         "https://archive-api.open-meteo.com/v1/archive"
-        f"?latitude={lat}&longitude={lon}"
+        f"?latitude={lat_r}&longitude={lon_r}"
         "&daily=temperature_2m_max,relative_humidity_2m_min"
         ",wind_speed_10m_max,precipitation_sum"
         "&start_date=1991-01-01&end_date=2020-12-31&timezone=UTC"
@@ -606,6 +699,11 @@ def _fetch_approx_fwi_q95(lat: float, lon: float) -> float:
         raw = _urlopen_with_ssl_fallback(url, timeout=30)
         data = json.loads(raw.decode())
     except (urllib.error.URLError, ValueError, OSError) as e:
+        if _strict:
+            raise RuntimeError(
+                f"wildfire API call failed for ({lat:.4f}, {lon:.4f}): {e}. "
+                "Reference-set build requires a successful fetch."
+            )
         logger.warning("wildfire API call failed for (%.4f, %.4f): %s", lat, lon, e)
         return 0.0
 
@@ -617,6 +715,11 @@ def _fetch_approx_fwi_q95(lat: float, lon: float) -> float:
 
     fwi_vals = _compute_fwi_series(temps, rhs, winds, precips)
     if not fwi_vals:
+        if _strict:
+            raise RuntimeError(
+                f"wildfire FWI series is empty for ({lat:.4f}, {lon:.4f}). "
+                "Reference-set build requires non-empty FWI data."
+            )
         return 0.0
 
     fwi_sorted = sorted(fwi_vals)
@@ -629,7 +732,7 @@ def _score_wildfire(supplier: Supplier) -> HazardScore:
     fwi_q95 = _fetch_approx_fwi_q95(supplier.lat, supplier.lon)
     fwi_q95 = _guard_raw("wildfire", supplier.name, supplier.lat, supplier.lon, fwi_q95)
     ref = load_reference_set()["hazards"]["wildfire"]
-    if ref[0] == ref[-1]:
+    if not ref or ref[0] == ref[-1]:
         logger.warning("Wildfire reference array is constant (non-informative)")
     h = percentile_rank(fwi_q95, ref)
     return _build_hazard_score(
@@ -663,7 +766,7 @@ def _score_cyclone(supplier: Supplier) -> HazardScore:
     else:
         v100_kmh = _db_lookup(_CYCLONE_DB, grid_key(supplier.lat, 1), grid_key(supplier.lon, 1))
     ref = load_reference_set()["hazards"]["cyclone"]
-    if ref[0] == ref[-1]:
+    if not ref or ref[0] == ref[-1]:
         logger.warning("Cyclone reference array is constant (non-informative)")
     h = percentile_rank(v100_kmh, ref)
     return _build_hazard_score(
@@ -737,7 +840,7 @@ def compute_risk_summary(
 ) -> dict:
     """Compute Supplier Multi-Hazard Exposure Index (SMHEI) from hazard scores.
 
-    Primary: equal-weight arithmetic mean over N_HAZARDS=6 hazards.
+    Primary: equal-weight arithmetic mean over informative hazards only.
     Sensitivity: geometric mean (aggregation="geometric") or custom weights.
 
     Parameters
@@ -747,16 +850,20 @@ def compute_risk_summary(
     suppliers : list[dict]
         Supplier metadata dicts (name, tier, confidence, evidence_source).
     weights : dict[str, float] | None
-        None = equal 1/N_HAZARDS for all hazards (primary SMHEI).
+        None = equal weights over informative hazards (primary SMHEI).
         For sensitivity scenarios, pass explicit weight maps; unknown/negative
         weights raise ValueError immediately.
     aggregation : str
-        "arithmetic" (primary) or "geometric" (sensitivity-only).
-        Geometric mean uses equal weights and no epsilon smoothing; zero H gives E_s=0.
+            "arithmetic" (primary) or "geometric" (sensitivity-only).
+            Geometric mean uses informative hazards only and no epsilon smoothing;
+            zero H gives E_s=0.
     """
     reference_set = load_reference_set()
     supplier_thresholds = reference_set["supplier_exposure_thresholds"]
     company_thresholds = reference_set["company_exposure_thresholds"]
+    non_informative = set(
+        reference_set.get("metadata", {}).get("non_informative_hazards", [])
+    )
 
     supplier_meta = {s["name"]: s for s in suppliers}
 
@@ -768,16 +875,27 @@ def compute_risk_summary(
     supplier_risks: list[dict] = []
 
     for supplier_name, hazard_h in by_supplier.items():
+        informative_hazard_h = {
+            hazard: score
+            for hazard, score in hazard_h.items()
+            if hazard not in non_informative
+        }
+
         # --- Validate completeness ---
         if weights is None and len(hazard_h) != N_HAZARDS:
             raise ValueError(
                 f"Expected {N_HAZARDS} hazard scores for supplier '{supplier_name}', "
                 f"got {len(hazard_h)}: {sorted(hazard_h)}"
             )
+        if not informative_hazard_h:
+            raise ValueError(
+                f"All hazards are marked non-informative for supplier '{supplier_name}'; "
+                "cannot compute exposure index."
+            )
 
         # --- Build weight map ---
         if weights is None:
-            w = {h: 1.0 / N_HAZARDS for h in hazard_h}
+            w = {h: 1.0 / len(informative_hazard_h) for h in informative_hazard_h}
         else:
             unknown = set(weights) - set(hazard_h)
             if unknown:
@@ -790,24 +908,29 @@ def compute_risk_summary(
                     "Weights must be non-negative; got: "
                     + ", ".join(f"{k}={v}" for k, v in weights.items() if v < 0)
                 )
-            total_w = sum(weights.get(h, 0.0) for h in hazard_h)
+            total_w = sum(weights.get(h, 0.0) for h in informative_hazard_h)
             if total_w == 0.0:
                 raise ValueError(
-                    "All weights sum to zero — cannot compute weighted mean. "
-                    "At least one hazard must have a positive weight."
+                    "All informative-hazard weights sum to zero — cannot compute weighted mean. "
+                    "At least one informative hazard must have a positive weight."
                 )
-            w = weights
+            w = {h: weights.get(h, 0.0) for h in informative_hazard_h}
 
         # --- Aggregate ---
         if aggregation == "geometric":
             # True geometric mean — no epsilon. Zero H gives E_s=0 (intentional).
-            E_s = math.prod(h for h in hazard_h.values()) ** (1.0 / N_HAZARDS)
+            E_s = math.prod(h for h in informative_hazard_h.values()) ** (
+                1.0 / len(informative_hazard_h)
+            )
         else:
-            total_w = sum(w.get(h, 0.0) for h in hazard_h)
-            E_s = sum(hazard_h[h] * w.get(h, 0.0) for h in hazard_h) / total_w
+            total_w = sum(w.get(h, 0.0) for h in informative_hazard_h)
+            E_s = (
+                sum(informative_hazard_h[h] * w.get(h, 0.0) for h in informative_hazard_h)
+                / total_w
+            )
 
-        M_s = max(hazard_h.values())
-        dominant_hazard = max(hazard_h, key=hazard_h.get)
+        M_s = max(informative_hazard_h.values())
+        dominant_hazard = max(informative_hazard_h, key=informative_hazard_h.get)
 
         # --- Supplier exposure band ---
         if E_s >= supplier_thresholds["high"]:
@@ -938,7 +1061,7 @@ def load_suppliers(
 
 
 def resolve_company_profile(company: str) -> dict:
-    """Resolve a company name to a structured profile using GPT-4o.
+    """Resolve a company name to a structured profile using the configured LLM.
 
     Returns a dict with canonical_name, industry, products, headquarters,
     and description.  Used to provide context for supplier discovery.
@@ -946,12 +1069,7 @@ def resolve_company_profile(company: str) -> dict:
     prompts = load_prompts()
     template = prompts["company_profile_prompt"]
 
-    llm = ChatOpenAI(
-        model="gpt-4o",
-        temperature=0,
-        timeout=60,
-        max_retries=3,
-    )
+    llm = _make_llm(temperature=0, timeout=60, max_retries=5)
     structured_llm = llm.with_structured_output(CompanyProfile)
 
     prompt_text = template.format(company=company)
@@ -1021,12 +1139,7 @@ def discover_suppliers_llm(
         products = company_profile.get("products", [])
         products_str = ", ".join(products) if products else "Unknown"
 
-    llm = ChatOpenAI(
-        model="gpt-4o",
-        temperature=0,
-        timeout=90,
-        max_retries=3,
-    )
+    llm = _make_llm(temperature=0, timeout=90, max_retries=5)
     structured_llm = llm.with_structured_output(TierResponse)
 
     all_suppliers: list[Supplier] = []
@@ -1077,7 +1190,7 @@ def discover_suppliers_llm(
                 })
                 all_evidence.append({
                     "evidence_id": eid,
-                    "source": "LLM:gpt-4o",
+                    "source": f"LLM:{_DEFAULT_LLM_MODEL}",
                     "description": llm_sup.rationale,
                     "retrieved_at": now,
                 })
@@ -1162,19 +1275,14 @@ def generate_mitigations_llm(
     hazard_scores: list[dict],
     summary: dict,
 ) -> list[dict]:
-    """Generate mitigation strategies using GPT-4o structured output."""
+    """Generate mitigation strategies using the configured LLM."""
     prompts = load_prompts()
     template = prompts["mitigation_prompt"]
 
     risk_context = _build_risk_context(suppliers, hazard_scores, summary)
     prompt_text = template.format(company=company, risk_context=risk_context)
 
-    llm = ChatOpenAI(
-        model="gpt-4o",
-        temperature=0,
-        timeout=90,
-        max_retries=3,
-    )
+    llm = _make_llm(temperature=0, timeout=90, max_retries=5)
     structured_llm = llm.with_structured_output(MitigationResponse)
 
     response: MitigationResponse = structured_llm.invoke(
@@ -1195,19 +1303,14 @@ def suggest_alternatives_llm(
     hazard_scores: list[dict],
     summary: dict,
 ) -> list[dict]:
-    """Suggest lower-risk alternative suppliers using GPT-4o structured output."""
+    """Suggest lower-risk alternative suppliers using the configured LLM."""
     prompts = load_prompts()
     template = prompts["suggest_alternatives_prompt"]
 
     risk_context = _build_risk_context(suppliers, hazard_scores, summary)
     prompt_text = template.format(company=company, risk_context=risk_context)
 
-    llm = ChatOpenAI(
-        model="gpt-4o",
-        temperature=0,
-        timeout=90,
-        max_retries=3,
-    )
+    llm = _make_llm(temperature=0, timeout=90, max_retries=5)
     structured_llm = llm.with_structured_output(AlternativeResponse)
 
     response: AlternativeResponse = structured_llm.invoke(
@@ -1271,9 +1374,6 @@ def verify_suppliers_batch(
     web_evidence_counter = 1
 
     for s in ordered:
-        if budget.web_budget_remaining <= 0:
-            break
-
         supplier_name = s["name"]
         supplier_lower = supplier_name.lower()
         query = (
@@ -1447,7 +1547,7 @@ def extract_mentions_from_doc_llm(
     )
 
     try:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0, timeout=60, max_retries=2)
+        llm = _make_llm(temperature=0, timeout=60, max_retries=5)
         # Use function_calling to avoid strict JSON-schema issues with list[dict] fields.
         structured_llm = llm.with_structured_output(
             ClaimExtractionResponse, method="function_calling"
@@ -1721,15 +1821,6 @@ def verify_claim_against_evidence(
             direction="unclear",
         )
 
-    if budget is not None and budget.llm_budget_remaining <= 0:
-        verdict = "SUPPORTED" if has_relationship else "WEAK"
-        return VerificationVerdict(
-            verdict=verdict,
-            rationale="LLM budget exhausted; heuristic fallback used.",
-            supporting_quote="",
-            direction="unclear",
-        )
-
     # Build a focused snippet centred on the supplier mention.
     idx = text_lower.find(supplier_lower)
     if idx >= 0:
@@ -1740,7 +1831,7 @@ def verify_claim_against_evidence(
         snippet = evidence_text[:600]
 
     try:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0, timeout=60, max_retries=2)
+        llm = _make_llm(temperature=0, timeout=60, max_retries=5)
         structured_llm = llm.with_structured_output(VerificationVerdict)
         prompt_text = template.format(
             company=company,

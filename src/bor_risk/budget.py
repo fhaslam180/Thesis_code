@@ -1,8 +1,8 @@
-"""Budget tracking for LLM calls and web queries.
+"""Passive resource tracking for pipeline runs.
 
-Budget caps apply to LLM calls and web queries (the expensive,
-non-deterministic resources). Hazard scoring is deterministic
-and tracked for reporting but never capped.
+BudgetTracker records LLM calls, web queries, and hazard scores for
+logging and experiment accounting only.  There are no hard caps —
+the pipeline always runs to completion.
 """
 
 from __future__ import annotations
@@ -13,18 +13,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class BudgetTracker:
-    """Track resource consumption across a run.
-
-    Attributes
-    ----------
-    max_llm_calls : int
-        Maximum LLM API calls allowed (discovery, mitigations, etc.).
-    max_web_queries : int
-        Maximum web search queries allowed.
-    """
-
-    max_llm_calls: int = 20
-    max_web_queries: int = 30
+    """Track resource consumption across a run (passive counters only)."""
 
     llm_calls: int = 0
     web_queries: int = 0
@@ -47,28 +36,10 @@ class BudgetTracker:
         )
 
     def record_hazard_score(self, supplier: str, hazard: str) -> None:
-        """Record one hazard scoring call (tracked, never capped)."""
+        """Record one hazard scoring call."""
         self.hazard_scores += 1
         self.call_log.append(
             {"type": "hazard", "supplier": supplier, "hazard": hazard}
-        )
-
-    @property
-    def llm_budget_remaining(self) -> int:
-        """How many LLM calls are left."""
-        return max(0, self.max_llm_calls - self.llm_calls)
-
-    @property
-    def web_budget_remaining(self) -> int:
-        """How many web queries are left."""
-        return max(0, self.max_web_queries - self.web_queries)
-
-    @property
-    def budget_exhausted(self) -> bool:
-        """True when both LLM and web budgets are fully spent."""
-        return (
-            self.llm_calls >= self.max_llm_calls
-            and self.web_queries >= self.max_web_queries
         )
 
     def summary(self) -> dict:
@@ -77,7 +48,5 @@ class BudgetTracker:
             "llm_calls": self.llm_calls,
             "web_queries": self.web_queries,
             "hazard_scores": self.hazard_scores,
-            "max_llm_calls": self.max_llm_calls,
-            "max_web_queries": self.max_web_queries,
             "wall_clock_seconds": round(time.time() - self.wall_clock_start, 2),
         }

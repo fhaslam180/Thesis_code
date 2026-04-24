@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -90,35 +91,60 @@ _FLOOD_RESPONSE = json.dumps({
     },
 }).encode()
 
+# 20 days, 5 of them >= 32 C → heat fraction = 5/20 = 0.25 (deterministic)
 _HEAT_RESPONSE = json.dumps({
     "daily": {
         "apparent_temperature_max": [
             12.5, 13.1, 11.8, 14.2, 10.9,
-            22.3, 25.1, 28.4, 30.2, 31.0,
+            33.0, 35.5, 34.2, 36.1, 32.8,   # 5 hot days
             29.2, 27.8, 24.5, 20.3, 18.0,
             15.1, 12.7, 10.4, 14.9, 16.6,
         ],
     },
 }).encode()
 
-_PRECIP_RESPONSE = json.dumps({
+# 100 days of fire-prone conditions → FWI series converges to non-zero Q95
+_WILDFIRE_RESPONSE = json.dumps({
     "daily": {
-        "time": [
-            "2015-01-01", "2015-01-15", "2015-02-01", "2015-02-15",
-            "2015-03-01", "2015-03-15", "2015-04-01", "2015-04-15",
-            "2015-05-01", "2015-05-15", "2015-06-01", "2015-06-15",
-            "2015-07-01", "2015-07-15", "2015-08-01", "2015-08-15",
-            "2015-09-01", "2015-09-15", "2015-10-01", "2015-10-15",
-            "2015-11-01", "2015-11-15", "2015-12-01", "2015-12-15",
-        ],
-        "precipitation_sum": [
-            12.5, 10.8, 14.2, 11.5,
-            9.8, 8.4, 10.1, 12.3,
-            8.6, 7.5, 9.2, 11.0,
-            7.8, 8.1, 9.5, 10.4,
-            11.2, 9.8, 12.1, 10.5,
-            13.4, 11.8, 14.0, 12.2,
-        ],
+        "temperature_2m_max": [35.0] * 100,
+        "relative_humidity_2m_min": [20.0] * 100,
+        "wind_speed_10m_max": [30.0] * 100,
+        "precipitation_sum": [0.0] * 100,
+    },
+}).encode()
+
+
+def _make_monthly_dates(n: int) -> list[str]:
+    """Generate n unique YYYY-MM-15 dates starting from 1991-01."""
+    dates: list[str] = []
+    year, month = 1991, 1
+    for _ in range(n):
+        dates.append(f"{year}-{month:02d}-15")
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return dates
+
+
+_DROUGHT_N = 200
+_DROUGHT_DATES = _make_monthly_dates(_DROUGHT_N)
+# Seasonal precip with inter-annual drought years (every 5th year: halved)
+_DROUGHT_PRECIP = [
+    max(5.0, (60.0 + 30.0 * math.sin(2 * math.pi * (i % 12) / 12))
+        * (0.5 if (i // 12) % 5 == 3 else 1.0))
+    for i in range(_DROUGHT_N)
+]
+_DROUGHT_ET0 = [
+    35.0 + 15.0 * math.sin(2 * math.pi * (i % 12) / 12 + math.pi / 4)
+    for i in range(_DROUGHT_N)
+]
+# 200 unique months (> 180 minimum), with drought years → SPEI-12 fraction > 0
+_DROUGHT_RESPONSE = json.dumps({
+    "daily": {
+        "time": _DROUGHT_DATES,
+        "precipitation_sum": _DROUGHT_PRECIP,
+        "et0_fao_evapotranspiration": _DROUGHT_ET0,
     },
 }).encode()
 
@@ -144,32 +170,54 @@ def _usgs_response_for_url(url_str: str) -> bytes:
 
 
 def _url_router(url, *args, **kwargs) -> MagicMock:
-    """Route mock urllib responses based on the URL being called."""
+    """Route mock urllib responses based on the URL being called.
+
+    Specificity-first: drought and wildfire both use archive-api.open-meteo.com,
+    so they are distinguished by their unique query parameters before the
+    generic precipitation_sum check would match both.
+    """
     url_str = url if isinstance(url, str) else str(url)
     if "earthquake.usgs.gov" in url_str:
         return _make_mock_response(_usgs_response_for_url(url_str))
     if "flood-api.open-meteo.com" in url_str:
         return _make_mock_response(_FLOOD_RESPONSE)
     if "archive-api.open-meteo.com" in url_str:
-        if "apparent_temperature_max" in url_str:
+        if "apparent_temperature_max" in url_str:       # heat_stress
             return _make_mock_response(_HEAT_RESPONSE)
-        if "precipitation_sum" in url_str:
-            return _make_mock_response(_PRECIP_RESPONSE)
-    # Default fallback
-    return _make_mock_response(b"0")
+        if "et0_fao_evapotranspiration" in url_str:     # drought (unique parameter)
+            return _make_mock_response(_DROUGHT_RESPONSE)
+        if "temperature_2m_max" in url_str:             # wildfire (unique parameter)
+            return _make_mock_response(_WILDFIRE_RESPONSE)
+    # Default fallback — valid empty JSON so callers don't crash on decode
+    return _make_mock_response(b'{"daily": {}}')
 
 
 @pytest.fixture(autouse=True)
-def mock_urlopen():
+def mock_urlopen(tmp_path: Path):
     """Globally mock urllib.request.urlopen with URL-aware routing.
 
-    Routes responses based on the URL domain and parameters:
-    - earthquake.usgs.gov -> location-aware count (1000 for seismic zones, 5 for stable regions)
-    - flood-api.open-meteo.com -> canned GloFAS discharge data
-    - archive-api.open-meteo.com (temperature) -> canned ERA5 heat data
-    - archive-api.open-meteo.com (precipitation) -> canned ERA5 precip data
+    Also isolates the API hazard cache per test:
+    - Sets _api_cache to an empty dict (blocks reads from committed cache file)
+    - Redirects _API_CACHE_PATH to tmp_path (blocks writes to committed cache file)
+    Both are restored to their original values after each test.
 
-    Tests can override by accepting this fixture and changing side_effect.
+    Routes responses based on URL domain and unique query parameters:
+    - earthquake.usgs.gov → location-aware count
+    - flood-api.open-meteo.com → canned GloFAS discharge
+    - archive-api.open-meteo.com + apparent_temperature_max → heat (5/20 days >= 32 C)
+    - archive-api.open-meteo.com + et0_fao_evapotranspiration → drought (200 months)
+    - archive-api.open-meteo.com + temperature_2m_max → wildfire (100 fire-prone days)
     """
+    import bor_risk.tools as _tools
+
+    saved_cache = _tools._api_cache
+    saved_path = _tools._API_CACHE_PATH
+
+    _tools._api_cache = {}                                         # blocks disk reads
+    _tools._API_CACHE_PATH = tmp_path / "api_hazard_cache.json"   # blocks disk writes
+
     with patch("urllib.request.urlopen", side_effect=_url_router) as m:
         yield m
+
+    _tools._api_cache = saved_cache   # restore original value, not just None
+    _tools._API_CACHE_PATH = saved_path

@@ -9,7 +9,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from bor_risk.budget import BudgetTracker
 from bor_risk.evidence_store import EvidenceStore
 from bor_risk.graph import HAZARD_NAMES, build_vcg_graph, run_vcg_graph
 from bor_risk.provenance import ProvenanceExporter
@@ -184,18 +183,6 @@ def main(argv: list[str] | None = None) -> None:
         help="Print a Mermaid diagram of the graph and exit.",
     )
     parser.add_argument(
-        "--budget-llm",
-        type=int,
-        default=20,
-        help="Max LLM calls (default: 20).",
-    )
-    parser.add_argument(
-        "--budget-web",
-        type=int,
-        default=30,
-        help="Max web queries (default: 30).",
-    )
-    parser.add_argument(
         "--snapshot",
         action="store_true",
         help="Use cached web results only (for reproducible evaluation).",
@@ -230,11 +217,6 @@ def main(argv: list[str] | None = None) -> None:
     strict_mode = args.strict
     use_llm = not args.no_llm
 
-    budget = BudgetTracker(
-        max_llm_calls=args.budget_llm,
-        max_web_queries=args.budget_web,
-    )
-
     import os
     if enable_web and not os.environ.get("TAVILY_API_KEY"):
         print(
@@ -268,19 +250,17 @@ def main(argv: list[str] | None = None) -> None:
         enable_web=enable_web,
         no_verify=no_verify,
         strict_mode=strict_mode,
-        max_web_queries=args.budget_web,
         snapshot_mode=args.snapshot,
-        budget=budget,
     )
 
-    # Print budget summary
-    bs = state.get("budget_summary", budget.summary())
+    # Print resource usage summary
+    bs = state.get("budget_summary", {})
     print(
-        f"\n  Budget used: {bs.get('llm_calls', 0)}/{args.budget_llm} LLM, "
-        f"{bs.get('web_queries', 0)}/{args.budget_web} web, "
-        f"{bs.get('hazard_scores', 0)} hazard scores"
+        f"\n  Budget used: {bs.get('llm_calls', 0)} LLM, "
+        f"{bs.get('web_queries', 0)} web, "
+        f"{bs.get('hazard_scores', 0)} hazard scores  "
+        f"({bs.get('wall_clock_seconds', 0):.1f}s)"
     )
-    print(f"  Wall clock: {bs.get('wall_clock_seconds', 0):.1f}s")
 
     # Claim summary
     claims = state.get("claims", [])

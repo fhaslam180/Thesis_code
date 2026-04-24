@@ -15,6 +15,7 @@ Experimental conditions (ablations of the VCG method):
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -27,6 +28,10 @@ from bor_risk.graph import run_vcg_graph
 from bor_risk.utils import load_prompts
 
 _GROUND_TRUTH_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "ground_truth"
+_DEFAULT_JUDGE_MODEL = os.getenv(
+    "BOR_RISK_JUDGE_MODEL",
+    os.getenv("BOR_RISK_LLM_MODEL", "gpt-4.1-mini"),
+)
 
 # Default evaluation companies.
 EVAL_COMPANIES = [
@@ -284,7 +289,12 @@ def judge_report_quality(company: str, state: dict) -> dict:
             return {"judge_scores": {}}
 
         prompt_text = template.format(report_text=report_text[:3000])
-        llm = ChatOpenAI(model="gpt-4o", temperature=0, timeout=60)
+        llm = ChatOpenAI(
+            model=_DEFAULT_JUDGE_MODEL,
+            temperature=0,
+            timeout=60,
+            max_retries=5,
+        )
         response = llm.invoke([HumanMessage(content=prompt_text)])
         content = response.content.strip()
 
@@ -312,7 +322,6 @@ def run_condition(
     company: str,
     condition: str,
     tier_depth: int = 2,
-    budget: BudgetTracker | None = None,
     snapshot: bool = True,
     no_llm: bool = False,
 ) -> dict:
@@ -334,7 +343,7 @@ def run_condition(
         )
 
     enable_web, no_verify, strict_mode = CONDITIONS[condition]
-    budget = budget or BudgetTracker()
+    budget = BudgetTracker()
 
     state = run_vcg_graph(
         company=company,
@@ -343,7 +352,6 @@ def run_condition(
         enable_web=enable_web,
         no_verify=no_verify,
         strict_mode=strict_mode,
-        max_web_queries=budget.max_web_queries,
         snapshot_mode=snapshot,
         budget=budget,
     )
@@ -361,8 +369,6 @@ def run_condition(
 def evaluate_company(
     company: str,
     tier_depth: int = 2,
-    budget_llm: int = 20,
-    budget_web: int = 30,
     snapshot: bool = True,
     conditions: list[str] | None = None,
     skip_judge: bool = False,
@@ -375,17 +381,13 @@ def evaluate_company(
     results: dict = {}
 
     for condition in conditions:
-        budget = BudgetTracker(
-            max_llm_calls=budget_llm, max_web_queries=budget_web
-        )
         try:
             state = run_condition(
-                company, condition, tier_depth, budget, snapshot, no_llm=no_llm
+                company, condition, tier_depth, snapshot, no_llm=no_llm
             )
             metrics = {
                 **compute_ground_truth_metrics(company, state),
                 **compute_hard_metrics(state),
-                "budget": budget.summary(),
             }
             if not skip_judge:
                 metrics.update(judge_report_quality(company, state))
@@ -399,8 +401,6 @@ def evaluate_company(
 def evaluate_batch(
     companies: list[str],
     tier_depth: int = 2,
-    budget_llm: int = 20,
-    budget_web: int = 30,
     snapshot: bool = True,
     conditions: list[str] | None = None,
     skip_judge: bool = False,
@@ -412,8 +412,6 @@ def evaluate_batch(
         result = evaluate_company(
             company,
             tier_depth=tier_depth,
-            budget_llm=budget_llm,
-            budget_web=budget_web,
             snapshot=snapshot,
             conditions=conditions,
             skip_judge=skip_judge,
@@ -644,18 +642,6 @@ def eval_main(argv: list[str] | None = None) -> None:
         help="Supplier tiers to explore (default: 2).",
     )
     parser.add_argument(
-        "--budget-llm",
-        type=int,
-        default=20,
-        help="Max LLM calls per condition (default: 20).",
-    )
-    parser.add_argument(
-        "--budget-web",
-        type=int,
-        default=30,
-        help="Max web queries per condition (default: 30).",
-    )
-    parser.add_argument(
         "--snapshot",
         action="store_true",
         help="Use cached web results only (reproducible).",
@@ -702,14 +688,11 @@ def eval_main(argv: list[str] | None = None) -> None:
         f"Evaluating {len(companies)} companies across "
         f"{len(selected_conditions) if selected_conditions else 4} conditions..."
     )
-    print(f"Budget: {args.budget_llm} LLM / {args.budget_web} web per condition")
     print()
 
     results = evaluate_batch(
         companies,
         tier_depth=args.tier_depth,
-        budget_llm=args.budget_llm,
-        budget_web=args.budget_web,
         snapshot=args.snapshot,
         conditions=selected_conditions,
         skip_judge=args.skip_judge,

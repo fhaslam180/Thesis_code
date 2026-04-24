@@ -285,7 +285,6 @@ class GraphState(TypedDict, total=False):
     enable_web: bool
     snapshot_mode: bool
     budget_summary: dict
-    _max_web_queries: int
     _budget_tracker: object  # BudgetTracker instance, not serialised
     # VCG fields
     claims: list[dict]            # list[Claim.model_dump()]

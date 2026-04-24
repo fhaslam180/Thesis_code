@@ -28,9 +28,17 @@ tier_expansion_prompt: |
   - product_category: What they supply to the parent (e.g., "Silicon wafers", "Raw steel")
   - relationship_type: One of: raw_material, component, service, logistics
 
-  Focus on major, well-known suppliers based on public knowledge.
-  If you are uncertain, reflect that in a lower confidence score.
-  Return between 2 and 6 suppliers.
+  Focus on breadth and recall, not just the most famous suppliers.
+  Include a wide range of plausible suppliers when justified by public knowledge,
+  including major, mid-sized, upstream, regional, contract manufacturing,
+  raw-material, chemical, component, packaging, equipment, and logistics suppliers.
+  For tier 2 and deeper, reason about the likely inputs, materials, equipment,
+  and services the parent supplier would need in order to supply its own products.
+  Aim to return 15-30 distinct supplier candidates per parent when plausible.
+  Do not stop after listing only a few well-known names.
+  If you are uncertain, still include plausible candidates with lower confidence
+  and a clear rationale rather than omitting them entirely.
+  Avoid duplicates and near-duplicate naming variants.
 
 mitigation_prompt: |
   You are a supply-chain resilience expert. Given the company "{company}"

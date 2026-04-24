@@ -1,0 +1,111 @@
+{
+  "metadata": {
+    "collected_at": "2026-04-04T15:01:59.008186+00:00",
+    "n_companies": 1,
+    "corpus_note": "study-specific: supplier locations for benchmark companies. Normalization basis \u2014 do NOT regenerate mid-study."
+  },
+  "companies": {
+    "Apple": [
+      {
+        "name": "Foxconn Technology Group",
+        "lat": 24.9934,
+        "lon": 121.2969
+      },
+      {
+        "name": "TSMC (Taiwan Semiconductor Manufacturing Company)",
+        "lat": 24.7854,
+        "lon": 120.9975
+      },
+      {
+        "name": "Samsung Electronics",
+        "lat": 37.5665,
+        "lon": 126.978
+      },
+      {
+        "name": "LG Display",
+        "lat": 37.4563,
+        "lon": 126.7052
+      },
+      {
+        "name": "Murata Manufacturing Co., Ltd.",
+        "lat": 34.683,
+        "lon": 135.833
+      },
+      {
+        "name": "Corning Incorporated",
+        "lat": 42.1429,
+        "lon": -77.0547
+      },
+      {
+        "name": "LG Chem",
+        "lat": 37.4665,
+        "lon": 127.0364
+      },
+      {
+        "name": "Nidec Corporation",
+        "lat": 34.683,
+        "lon": 135.5
+      },
+      {
+        "name": "Shin-Etsu Chemical Co., Ltd.",
+        "lat": 36.2048,
+        "lon": 138.2529
+      },
+      {
+        "name": "Sumco Corporation",
+        "lat": 35.6895,
+        "lon": 139.6917
+      },
+      {
+        "name": "BASF SE",
+        "lat": 49.4875,
+        "lon": 8.466
+      },
+      {
+        "name": "Air Products and Chemicals, Inc.",
+        "lat": 40.6023,
+        "lon": -75.4724
+      },
+      {
+        "name": "Murata Manufacturing",
+        "lat": 34.6851,
+        "lon": 135.8048
+      },
+      {
+        "name": "Sumitomo Chemical",
+        "lat": 34.6863,
+        "lon": 135.52
+      },
+      {
+        "name": "3M Company",
+        "lat": 44.9778,
+        "lon": -93.265
+      },
+      {
+        "name": "Sumitomo Chemical Co., Ltd.",
+        "lat": 34.6833,
+        "lon": 135.8333
+      },
+      {
+        "name": "Nitto Denko Corporation",
+        "lat": 34.6864,
+        "lon": 135.52
+      },
+      {
+        "name": "Schott AG",
+        "lat": 50.0,
+        "lon": 8.2711
+      },
+      {
+        "name": "Saint-Gobain S.A.",
+        "lat": 48.8566,
+        "lon": 2.3522
+      },
+      {
+        "name": "Nippon Electric Glass Co., Ltd.",
+        "lat": 34.6937,
+        "lon": 135.5023
+      }
+    ]
+  }
+}

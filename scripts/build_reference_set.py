@@ -55,6 +55,15 @@ EVAL_COMPANIES = [
     "Walmart", "Nestlé", "Unilever", "Nike", "Adidas",
 ]
 
+_HAZARD_ORDER = (
+    "earthquake",
+    "flood",
+    "wildfire",
+    "cyclone",
+    "heat_stress",
+    "drought",
+)
+
 
 # ---------------------------------------------------------------------------
 # Phase 1: Corpus collection
@@ -189,13 +198,15 @@ def _compute_raw_hazards(lat: float, lon: float) -> dict[str, float]:
         raw["cyclone"] = _db_lookup(_CYCLONE_DB, grid_key(lat, 1), grid_key(lon, 1))
 
     # Wildfire — approx FWI Q95, Open-Meteo ERA5
-    raw["wildfire"] = _fetch_approx_fwi_q95(lat, lon)
+    # _strict=True: API failures raise RuntimeError so they are not silently
+    # accepted as valid zero-exposure values in the reference corpus.
+    raw["wildfire"] = _fetch_approx_fwi_q95(lat, lon, _strict=True)
 
     # Heat stress — fraction days apparent_temperature_max >= 32°C, Open-Meteo ERA5
-    raw["heat_stress"] = _fetch_heat_fraction(lat, lon)
+    raw["heat_stress"] = _fetch_heat_fraction(lat, lon, _strict=True)
 
     # Drought — fraction months SPEI-12 <= -1, Open-Meteo ERA5
-    raw["drought"] = _fetch_spei12_fraction(lat, lon)
+    raw["drought"] = _fetch_spei12_fraction(lat, lon, _strict=True)
 
     # Fail-fast on non-finite values
     for hazard, value in raw.items():
@@ -212,6 +223,37 @@ def _compute_raw_hazards(lat: float, lon: float) -> dict[str, float]:
     return raw
 
 
+def _compute_supplier_exposure_indices(
+    supplier_raws: list[dict[str, float]],
+    hazard_raws: dict[str, list[float]],
+    non_informative: list[str],
+) -> tuple[list[float], list[str]]:
+    """Compute per-location exposure indices using informative hazards only.
+
+    Non-informative hazards are excluded entirely from the composite. Treating
+    them as neutral 0.5 values collapses the exposure distribution and produces
+    degenerate tertile thresholds when several hazards are constant.
+    """
+    from bor_risk.utils import percentile_rank
+
+    informative_hazards = [h for h in _HAZARD_ORDER if h not in set(non_informative)]
+    if not informative_hazards:
+        raise ValueError(
+            "All hazards are non-informative in the reference corpus; "
+            "cannot compute exposure thresholds."
+        )
+
+    supplier_Es: list[float] = []
+    for raw in supplier_raws:
+        Hs = [
+            percentile_rank(raw.get(hazard, 0.0), hazard_raws[hazard])
+            for hazard in informative_hazards
+        ]
+        supplier_Es.append(sum(Hs) / len(Hs))
+
+    return supplier_Es, informative_hazards
+
+
 def _build_reference_set(locations_path: Path, out: Path) -> None:
     """Build reference_set.json from frozen reference_locations.json."""
     payload = json.loads(locations_path.read_text())
@@ -221,7 +263,7 @@ def _build_reference_set(locations_path: Path, out: Path) -> None:
     for locs in companies.values():
         all_locations.extend(locs)
 
-    n_total = len(all_locations)
+    n_total = sum(len(locs) for locs in companies.values())
     logger.info("Processing %d locations across %d companies", n_total, len(companies))
 
     # Collect raw values per hazard
@@ -229,21 +271,28 @@ def _build_reference_set(locations_path: Path, out: Path) -> None:
         "earthquake": [], "flood": [], "wildfire": [],
         "cyclone": [], "heat_stress": [], "drought": [],
     }
-    supplier_raws: list[dict[str, float]] = []  # per-location raw dict (for E_s computation)
+    supplier_raws: list[dict[str, float]] = []  # flat list for percentile ranking
+    company_supplier_raws: list[list[dict]] = []  # per-company successful raws
 
-    for i, loc in enumerate(all_locations):
-        lat = float(loc["lat"])
-        lon = float(loc["lon"])
-        name = loc.get("name", f"loc_{i}")
-        logger.info("[%d/%d] %s (%.4f, %.4f)", i + 1, n_total, name, lat, lon)
-        try:
-            raw = _compute_raw_hazards(lat, lon)
-        except (ValueError, Exception) as e:
-            logger.error("Failed for '%s' at (%.4f, %.4f): %s — skipping", name, lat, lon, e)
-            continue
-        for hazard, value in raw.items():
-            hazard_raws[hazard].append(value)
-        supplier_raws.append(raw)
+    flat_idx = 0
+    for company_name, company_locs in companies.items():
+        per_company_raws: list[dict] = []
+        for loc in company_locs:
+            flat_idx += 1
+            lat = float(loc["lat"])
+            lon = float(loc["lon"])
+            name = loc.get("name", f"loc_{flat_idx}")
+            logger.info("[%d/%d] %s (%.4f, %.4f)", flat_idx, n_total, name, lat, lon)
+            try:
+                raw = _compute_raw_hazards(lat, lon)
+            except (ValueError, Exception) as e:
+                logger.error("Failed for '%s' at (%.4f, %.4f): %s — skipping", name, lat, lon, e)
+                continue
+            for hazard, value in raw.items():
+                hazard_raws[hazard].append(value)
+            supplier_raws.append(raw)
+            per_company_raws.append(raw)
+        company_supplier_raws.append(per_company_raws)
 
     # Sort each hazard array
     for hazard in hazard_raws:
@@ -252,7 +301,14 @@ def _build_reference_set(locations_path: Path, out: Path) -> None:
     # Detect non-informative hazards (constant reference)
     non_informative: list[str] = []
     for hazard, arr in hazard_raws.items():
-        if arr and arr[0] == arr[-1]:
+        if not arr:
+            non_informative.append(hazard)
+            logger.warning(
+                "WARNING: hazard '%s' has no values in the reference corpus "
+                "and will be treated as non-informative",
+                hazard,
+            )
+        elif arr[0] == arr[-1]:
             non_informative.append(hazard)
             logger.warning(
                 "WARNING: hazard '%s' is constant across reference corpus "
@@ -260,27 +316,9 @@ def _build_reference_set(locations_path: Path, out: Path) -> None:
                 hazard, arr[0],
             )
 
-    # Compute per-supplier E_s (arithmetic mean over 6 hazards)
-    # Requires sorted reference arrays to compute percentile ranks
-    from bor_risk.utils import percentile_rank
-
-    def _make_sorted(hazard: str) -> list[float]:
-        return hazard_raws[hazard]
-
-    supplier_Es: list[float] = []
-    for raw in supplier_raws:
-        Hs = []
-        for hazard in ("earthquake", "flood", "wildfire", "cyclone", "heat_stress", "drought"):
-            ref = _make_sorted(hazard)
-            if not ref:
-                h = 0.5
-            elif ref[0] == ref[-1]:
-                h = 0.5
-            else:
-                h = percentile_rank(raw.get(hazard, 0.0), ref)
-            Hs.append(h)
-        Es = sum(Hs) / 6.0
-        supplier_Es.append(Es)
+    supplier_Es, informative_hazards = _compute_supplier_exposure_indices(
+        supplier_raws, hazard_raws, non_informative
+    )
 
     supplier_Es_sorted = sorted(supplier_Es)
 
@@ -294,15 +332,22 @@ def _build_reference_set(locations_path: Path, out: Path) -> None:
     supplier_med = _empirical_tertile(supplier_Es_sorted, 1.0 / 3.0)
     supplier_high = _empirical_tertile(supplier_Es_sorted, 2.0 / 3.0)
 
-    # Company-level E_s: mean(E_s) per company
+    # Company-level E_s: mean(E_s) per company, sliced by actual success count
     company_Es: list[float] = []
     idx = 0
-    for locs in companies.values():
-        n = len(locs)
+    for per_company_raws in company_supplier_raws:
+        n = len(per_company_raws)   # actual successes, not attempted locations
         chunk = supplier_Es[idx:idx + n]
         if chunk:
             company_Es.append(sum(chunk) / len(chunk))
         idx += n
+
+    if idx != len(supplier_Es):
+        raise RuntimeError(
+            f"Company grouping drift: consumed {idx} of {len(supplier_Es)} supplier "
+            "exposure values. Per-company success counts do not sum to total successes "
+            "— output would be silently wrong."
+        )
 
     company_Es_sorted = sorted(company_Es)
     company_med = _empirical_tertile(company_Es_sorted, 1.0 / 3.0)
@@ -318,6 +363,7 @@ def _build_reference_set(locations_path: Path, out: Path) -> None:
                 "Percentile ranks are relative to this corpus, not a universal baseline."
             ),
             "non_informative_hazards": non_informative,
+            "informative_hazards": informative_hazards,
         },
         "hazards": hazard_raws,
         "supplier_exposure_thresholds": {

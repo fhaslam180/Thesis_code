@@ -56,7 +56,7 @@ from bor_risk.tools import (
     suggest_alternatives_llm,
     verify_claim_against_evidence,
 )
-from bor_risk.utils import load_hazards
+from bor_risk.utils import grid_key, load_hazards
 
 HIGH_RISK_THRESHOLD = 0.4
 CRITICAL_EXCEEDANCE_MARGIN = 0.2
@@ -217,9 +217,6 @@ def retrieve_evidence_node(state: GraphState) -> dict:
     _search_warned = False
 
     for claim in claims:
-        if budget and budget.web_budget_remaining <= 0:
-            break
-
         query = (
             f'"{company}" "{claim.object_entity_id}" '
             f"supplier OR vendor OR manufacturer"
@@ -314,9 +311,6 @@ def extract_mentions_node(state: GraphState) -> dict:
     all_mentions: list[dict] = []
 
     for packet_dict in packets:
-        if budget and budget.llm_budget_remaining <= 0:
-            break
-
         evidence_id = packet_dict.get("evidence_id", "")
         snapshot_path = packet_dict.get("snapshot_path")
 
@@ -404,18 +398,12 @@ def verify_claims_node(state: GraphState) -> dict:
             verified_claims.append(claim.model_dump())
             continue
 
-        if budget and budget.llm_budget_remaining <= 0:
-            verified_claims.append(claim.model_dump())
-            continue
-
         # Step 3: Iterate all evidence refs, keep best verdict by
         # SUPPORTED > DISPUTED > WEAK > UNKNOWN.
         best_verdict_obj = None
         best_used_eid = ""
 
         for eid in claim.evidence_refs:
-            if budget and budget.llm_budget_remaining <= 0:
-                break
             packet_dict = packets.get(eid)
             if not packet_dict:
                 continue
@@ -522,15 +510,40 @@ def resolve_locations_node(state: GraphState) -> dict:
 
 # -- Parallel hazard scoring (fan-out / fan-in) ----------------------------
 
+_HAZARD_DEDUP_DECIMALS: dict[str, int] = {
+    "earthquake": 1,
+    "flood": 2,
+    "cyclone": 1,
+    "heat_stress": 1,
+    "drought": 1,
+    "wildfire": 1,
+}
+
 
 def _make_hazard_scorer(hazard_name: str):
-    """Factory: create a node that scores all suppliers for one hazard type."""
+    """Factory: create a node that scores all suppliers for one hazard type.
+
+    Deduplicates suppliers to the hazard's native grid resolution before
+    fetching scores, then fans results back out to all suppliers in each cell.
+    """
+    decimals = _HAZARD_DEDUP_DECIMALS[hazard_name]
+
     def _score_node(state: GraphState) -> dict:
         scores: list[dict] = []
+        loc_map: dict[tuple[int, int], list[dict]] = {}
         for s_dict in state.get("suppliers", []):
             supplier = Supplier(**s_dict)
-            hs = compute_hazard(supplier, hazard_name)
-            scores.append(hs.model_dump())
+            cell = (grid_key(supplier.lat, decimals), grid_key(supplier.lon, decimals))
+            loc_map.setdefault(cell, []).append(s_dict)
+
+        for cell_suppliers in loc_map.values():
+            representative = Supplier(**cell_suppliers[0])
+            hs = compute_hazard(representative, hazard_name)
+            base = hs.model_dump()
+            for s_dict in cell_suppliers:
+                entry = {**base, "supplier_name": s_dict["name"]}
+                scores.append(entry)
+
         return {
             "hazard_scores": scores,
             "workflow_trace": [f"score_{hazard_name}"],
@@ -685,7 +698,6 @@ def run_vcg_graph(
     enable_web: bool = False,
     no_verify: bool = False,
     strict_mode: bool = False,
-    max_web_queries: int = 30,
     snapshot_mode: bool = False,
     budget: BudgetTracker | None = None,
 ) -> dict:
@@ -704,7 +716,7 @@ def run_vcg_graph(
     config = {"configurable": {"thread_id": thread_id}}
 
     if budget is None:
-        budget = BudgetTracker(max_web_queries=max_web_queries)
+        budget = BudgetTracker()
 
     init_state: dict = {
         "company": company,
@@ -719,7 +731,6 @@ def run_vcg_graph(
         "claims": [],
         "evidence_packets": [],
         "_budget_tracker": budget,
-        "_max_web_queries": max_web_queries,
     }
     if suppliers_path is not None:
         init_state["suppliers_path"] = str(suppliers_path)

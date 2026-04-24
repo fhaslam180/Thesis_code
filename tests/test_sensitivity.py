@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from unittest.mock import patch
 
 from bor_risk.sensitivity import (
     build_default_scenarios,
@@ -110,6 +111,27 @@ class TestComputeRiskSummary:
         # Should not raise — weights= provided, no N_HAZARDS check
         summary = compute_risk_summary(state["hazard_scores"], state["suppliers"], weights=drop_w)
         assert "company_score" in summary
+
+    def test_non_informative_hazards_are_excluded_from_primary_smhei(self):
+        supplier = {"name": "S1", "tier": 1, "confidence": 0.8, "evidence_source": "fixture"}
+        scores = [
+            {"supplier_name": "S1", "hazard_type": "earthquake", "score": 0.5, "score_100": 50, "level": "Medium", "dataset_metadata": {}},
+            {"supplier_name": "S1", "hazard_type": "flood", "score": 0.5, "score_100": 50, "level": "Medium", "dataset_metadata": {}},
+            {"supplier_name": "S1", "hazard_type": "cyclone", "score": 0.5, "score_100": 50, "level": "Medium", "dataset_metadata": {}},
+            {"supplier_name": "S1", "hazard_type": "wildfire", "score": 0.0, "score_100": 0, "level": "Low", "dataset_metadata": {}},
+            {"supplier_name": "S1", "hazard_type": "heat_stress", "score": 0.0, "score_100": 0, "level": "Low", "dataset_metadata": {}},
+            {"supplier_name": "S1", "hazard_type": "drought", "score": 0.0, "score_100": 0, "level": "Low", "dataset_metadata": {}},
+        ]
+        reference_set = {
+            "metadata": {
+                "non_informative_hazards": ["earthquake", "flood", "cyclone"],
+            },
+            "supplier_exposure_thresholds": {"medium": 0.33, "high": 0.67},
+            "company_exposure_thresholds": {"medium": 0.35, "high": 0.65},
+        }
+        with patch("bor_risk.tools.load_reference_set", return_value=reference_set):
+            summary = compute_risk_summary(scores, [supplier])
+        assert summary["supplier_risks"][0]["exposure_index"] == pytest.approx(0.0, abs=1e-6)
 
 
 # ---------------------------------------------------------------------------

@@ -135,20 +135,21 @@ class TestHeatStressScoring:
         }).encode()
         from conftest import _make_mock_response
         mock_urlopen.side_effect = lambda url, *a, **kw: _make_mock_response(cold)
-        # clear cache so fresh API call is made
-        from bor_risk import tools as t
-        t._api_cache.clear() if t._api_cache is not None else None
         score = compute_hazard(_make_supplier(lat=99.0, lon=99.0), hazard_type="heat_stress")
         assert score.raw_value == 0.0
 
     def test_api_failure_returns_zero(self):
         import urllib.error
-        from bor_risk import tools as t
-        t._api_cache.clear() if t._api_cache is not None else None
         with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
             score = compute_hazard(_make_supplier(lat=88.0, lon=88.0), hazard_type="heat_stress")
         assert score.raw_value == 0.0
         assert score.score == 0.0
+
+    def test_successful_path_gives_correct_fraction(self):
+        """Mock provides 5/20 days >= 32 C → heat fraction = 0.25."""
+        score = compute_hazard(_make_supplier(lat=1.0, lon=1.0), hazard_type="heat_stress")
+        assert score.raw_value == pytest.approx(0.25)
+        assert score.score > 0.0
 
 
 # -------------------------------------------------------------------
@@ -171,12 +172,16 @@ class TestDroughtScoring:
 
     def test_api_failure_returns_zero(self):
         import urllib.error
-        from bor_risk import tools as t
-        t._api_cache.clear() if t._api_cache is not None else None
         with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
             score = compute_hazard(_make_supplier(lat=77.0, lon=77.0), hazard_type="drought")
         assert score.raw_value == 0.0
         assert score.score == 0.0
+
+    def test_successful_path_runs_spei_to_completion(self):
+        """Mock provides 200 months with drought years → SPEI-12 fraction > 0."""
+        score = compute_hazard(_make_supplier(lat=3.0, lon=3.0), hazard_type="drought")
+        assert score.raw_value > 0.0
+        assert 0.0 <= score.score <= 1.0
 
 
 # -------------------------------------------------------------------
@@ -200,12 +205,16 @@ class TestWildfireScoring:
 
     def test_api_failure_returns_zero(self):
         import urllib.error
-        from bor_risk import tools as t
-        t._api_cache.clear() if t._api_cache is not None else None
         with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
             score = compute_hazard(_make_supplier(lat=66.0, lon=66.0), hazard_type="wildfire")
         assert score.raw_value == 0.0
         assert score.score == 0.0
+
+    def test_successful_path_gives_nonzero_fwi(self):
+        """Mock provides 100 days of fire conditions → FWI Q95 > 0."""
+        score = compute_hazard(_make_supplier(lat=2.0, lon=2.0), hazard_type="wildfire")
+        assert score.raw_value > 0.0
+        assert 0.0 <= score.score <= 1.0
 
 
 # -------------------------------------------------------------------

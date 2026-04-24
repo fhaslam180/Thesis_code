@@ -103,7 +103,7 @@ class TestHardMetrics:
             ],
             "evidence": [
                 {"source": "web:https://example.com"},
-                {"source": "LLM:gpt-4o"},
+                {"source": "LLM:gpt-4.1-mini"},
             ],
             "claims": [],
             "evidence_packets": [],

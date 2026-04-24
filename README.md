@@ -72,9 +72,12 @@ Create a `.env` file with API keys:
 ```
 OPENAI_API_KEY=sk-...
 TAVILY_API_KEY=tvly-...
+BOR_RISK_LLM_MODEL=gpt-4.1-mini
+# Optional: use a different model only for the evaluation judge
+# BOR_RISK_JUDGE_MODEL=gpt-4.1-mini
 ```
 
-The OpenAI key is required for GPT-4o supplier discovery and mitigations. The Tavily key is required for web search in the `web_retrieve`, `web_verify`, and `strict` conditions.
+The OpenAI key is required for LLM-backed supplier discovery, verification, and report-generation steps. `BOR_RISK_LLM_MODEL` defaults to `gpt-4.1-mini`; set it to `gpt-4o-mini` for very cheap smoke tests or `gpt-4o` for final comparison runs. The Tavily key is required for web search in the `web_retrieve`, `web_verify`, and `strict` conditions.
 
 ### Data preprocessing (one-time)
 
