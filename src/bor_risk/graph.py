@@ -43,6 +43,7 @@ from bor_risk.models import (
 from bor_risk.provenance import ProvenanceExporter
 from bor_risk.report import format_report
 from bor_risk.tools import (
+    LOCATION_ACCEPT_THRESHOLD,
     compute_hazard,
     compute_risk_summary,
     discover_suppliers_llm,
@@ -139,10 +140,12 @@ def discover_claims_node(state: GraphState) -> dict:
     budget = state.get("_budget_tracker")
     profile = state.get("company_profile", {})
 
+    pre_dedup_count: int | None = None
     if use_llm:
-        suppliers, edges, evidence = discover_suppliers_llm(
+        suppliers, edges, evidence, meta = discover_suppliers_llm(
             company, tier_depth, company_profile=profile or None
         )
+        pre_dedup_count = meta.get("pre_dedup_supplier_count")
         if budget:
             parents: list[str] = [company]
             for tier in range(1, tier_depth + 1):
@@ -154,6 +157,8 @@ def discover_claims_node(state: GraphState) -> dict:
         suppliers, edges, evidence = load_suppliers(
             company, tier_depth, suppliers_path
         )
+        # Fixture path has no dedup step; pre == post.
+        pre_dedup_count = len(suppliers)
 
     claims = [
         _supplier_to_claim(s, company, i + 1).model_dump()
@@ -165,6 +170,7 @@ def discover_claims_node(state: GraphState) -> dict:
         "edges": edges,
         "evidence": evidence,
         "claims": claims,
+        "pre_dedup_supplier_count": pre_dedup_count,
         "workflow_trace": ["discover_claims"],
     }
 
@@ -496,6 +502,11 @@ def resolve_locations_node(state: GraphState) -> dict:
         if not claim.location_candidates:
             continue
         best = max(claim.location_candidates, key=lambda lc: lc.confidence)
+        # Fixture coordinates are always authoritative; otherwise require the
+        # evidence-derived candidate to reach the acceptance threshold before
+        # displacing LLM-supplied coordinates.
+        if best.confidence < LOCATION_ACCEPT_THRESHOLD and best.source != "fixture":
+            continue
         s = supplier_map.get(claim.object_entity_id)
         if s:
             s["lat"] = best.lat
@@ -563,18 +574,52 @@ def aggregate_risk_node(state: GraphState) -> dict:
     Uses default equal-weight arithmetic mean over N_HAZARDS=6 hazards.
     Bands are read from reference_set.json (supplier_exposure_thresholds,
     company_exposure_thresholds), not from hard-coded constants.
+
+    In strict mode, only suppliers with status==VERIFIED and
+    verdict in {SUPPORTED, WEAK} are included in the ranking.
     """
+    suppliers = list(state.get("suppliers", []))
+    hazard_scores = list(state.get("hazard_scores", []))
+    result: dict = {}
+
+    if state.get("strict_mode"):
+        claims = state.get("claims", [])
+        allowed_names: set[str] = {
+            c["object_entity_id"]
+            for c in claims
+            if c.get("status") == "VERIFIED"
+            and c.get("verdict") in {"SUPPORTED", "WEAK"}
+        }
+        if not allowed_names:
+            return {
+                "suppliers": [],
+                "report_hazard_scores": [],
+                "company_risk_summary": {},
+                "workflow_trace": [
+                    "aggregate_risk(strict: no verified suppliers — ranking empty)"
+                ],
+            }
+        pre_filter = len(suppliers)
+        suppliers = [s for s in suppliers if s["name"] in allowed_names]
+        hazard_scores = [h for h in hazard_scores if h["supplier_name"] in allowed_names]
+        filtered = pre_filter - len(suppliers)
+        result["suppliers"] = suppliers
+        # Store filtered scores in a replace-semantics field (not the additive reducer).
+        result["report_hazard_scores"] = hazard_scores
+        result["workflow_trace"] = [
+            f"aggregate_risk(strict: filtered {filtered} unverified suppliers)"
+        ]
+    else:
+        result["workflow_trace"] = ["aggregate_risk"]
+
     summary = compute_risk_summary(
-        state.get("hazard_scores", []),
-        state.get("suppliers", []),
+        hazard_scores,
+        suppliers,
         # weights=None → equal 1/N_HAZARDS (primary SMHEI)
         # aggregation="arithmetic" → default
     )
-
-    return {
-        "company_risk_summary": summary,
-        "workflow_trace": ["aggregate_risk"],
-    }
+    result["company_risk_summary"] = summary
+    return result
 
 
 def generate_report_node(state: GraphState) -> dict:
@@ -584,12 +629,21 @@ def generate_report_node(state: GraphState) -> dict:
     mitigations: list[dict] = []
     alternatives: list[dict] = []
 
+    # In strict mode aggregate_risk_node sets "report_hazard_scores" to the
+    # filtered list (possibly []). Use key presence — not truthiness — so an
+    # intentional empty strict result is never overridden by the full list.
+    effective_hazard_scores = (
+        state["report_hazard_scores"]
+        if "report_hazard_scores" in state
+        else state.get("hazard_scores", [])
+    )
+
     if use_llm:
         try:
             mitigations = generate_mitigations_llm(
                 company=state.get("company", "Unknown"),
                 suppliers=state.get("suppliers", []),
-                hazard_scores=state.get("hazard_scores", []),
+                hazard_scores=effective_hazard_scores,
                 summary=state.get("company_risk_summary", {}),
             )
             if budget:
@@ -601,7 +655,7 @@ def generate_report_node(state: GraphState) -> dict:
             alternatives = suggest_alternatives_llm(
                 company=state.get("company", "Unknown"),
                 suppliers=state.get("suppliers", []),
-                hazard_scores=state.get("hazard_scores", []),
+                hazard_scores=effective_hazard_scores,
                 summary=state.get("company_risk_summary", {}),
             )
             if budget:
@@ -614,6 +668,7 @@ def generate_report_node(state: GraphState) -> dict:
     full_trace = [*state.get("workflow_trace", []), "generate_report"]
     report_state = {
         **state,
+        "hazard_scores": effective_hazard_scores,
         "llm_mitigations": mitigations,
         "suggested_alternatives": alternatives,
         "workflow_trace": full_trace,

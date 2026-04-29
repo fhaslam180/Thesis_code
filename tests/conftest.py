@@ -23,6 +23,7 @@ _MOCK_REFERENCE_SET = {
         "source": "build_reference_set.py",
         "corpus": "study-specific: supplier locations for benchmark companies",
         "non_informative_hazards": [],
+        "informative_hazards": ["wildfire", "heat_stress", "drought"],
     },
     "hazards": {
         "earthquake": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
@@ -47,10 +48,12 @@ def mock_reference_set():
     """
     from bor_risk import utils as utils_module
     from bor_risk import tools as tools_module
+    from bor_risk import evaluate as evaluate_module
     utils_module.load_reference_set.cache_clear()
     with patch.object(utils_module, "load_reference_set", return_value=_MOCK_REFERENCE_SET):
         with patch.object(tools_module, "load_reference_set", return_value=_MOCK_REFERENCE_SET):
-            yield
+            with patch.object(evaluate_module, "load_reference_set", return_value=_MOCK_REFERENCE_SET):
+                yield
     utils_module.load_reference_set.cache_clear()
 
 

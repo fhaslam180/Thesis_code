@@ -178,3 +178,133 @@ class TestVCGIntegration:
     def test_report_contains_trace(self) -> None:
         state = run_vcg_graph("ACME", tier_depth=2, use_llm=False)
         assert "Trace:" in state["report_text"]
+
+
+# ---------------------------------------------------------------------------
+# 4. Strict-mode filtering tests
+# ---------------------------------------------------------------------------
+
+
+class TestStrictModeFiltering:
+    """aggregate_risk_node must filter unverified suppliers in strict mode."""
+
+    def _run_strict(self, claims_override: list[dict] | None = None):
+        """Run the graph in llm=False mode, then manually test the node."""
+        from bor_risk.graph import aggregate_risk_node
+
+        # Build a minimal state that exercises the strict-mode path.
+        suppliers = [
+            {"name": "VerifiedSupplier", "lat": 37.3, "lon": -121.9, "tier": 1},
+            {"name": "UnverifiedSupplier", "lat": 31.2, "lon": 121.5, "tier": 1},
+        ]
+        _hazards = ["earthquake", "flood", "wildfire", "cyclone", "heat_stress", "drought"]
+        hazard_scores = [
+            {"supplier_name": name, "hazard_type": h, "score": 0.5}
+            for name in ("VerifiedSupplier", "UnverifiedSupplier")
+            for h in _hazards
+        ]
+        claims = claims_override or [
+            {
+                "object_entity_id": "VerifiedSupplier",
+                "status": "VERIFIED",
+                "verdict": "SUPPORTED",
+            },
+            {
+                "object_entity_id": "UnverifiedSupplier",
+                "status": "PROPOSED",
+                "verdict": "UNKNOWN",
+            },
+        ]
+        state = {
+            "company": "TestCo",
+            "suppliers": suppliers,
+            "hazard_scores": hazard_scores,
+            "claims": claims,
+            "strict_mode": True,
+        }
+        return aggregate_risk_node(state)
+
+    def test_verified_supplier_retained(self):
+        result = self._run_strict()
+        supplier_names = {s["name"] for s in result.get("suppliers", [])}
+        assert "VerifiedSupplier" in supplier_names
+
+    def test_unverified_supplier_removed(self):
+        result = self._run_strict()
+        supplier_names = {s["name"] for s in result.get("suppliers", [])}
+        assert "UnverifiedSupplier" not in supplier_names
+
+    def test_hazard_scores_also_filtered(self):
+        result = self._run_strict()
+        # report_hazard_scores holds the filtered set; hazard_scores is not written
+        filtered_scores = result.get("report_hazard_scores", [])
+        score_names = {h["supplier_name"] for h in filtered_scores}
+        assert "UnverifiedSupplier" not in score_names
+        assert "VerifiedSupplier" in score_names
+
+    def test_empty_verified_set_returns_empty_state(self):
+        all_unknown_claims = [
+            {
+                "object_entity_id": "SupplierA",
+                "status": "PROPOSED",
+                "verdict": "UNKNOWN",
+            }
+        ]
+        result = self._run_strict(claims_override=all_unknown_claims)
+        assert result.get("suppliers") == []
+        assert result.get("report_hazard_scores") == []
+        trace = result.get("workflow_trace", [])
+        assert any("no verified suppliers" in t for t in trace)
+
+    def test_non_strict_mode_does_not_filter(self):
+        from bor_risk.graph import aggregate_risk_node
+        state = {
+            "company": "TestCo",
+            "suppliers": [
+                {"name": "SupA", "lat": 37.3, "lon": -121.9, "tier": 1},
+            ],
+            "hazard_scores": [],
+            "claims": [{"object_entity_id": "SupA", "status": "PROPOSED", "verdict": "UNKNOWN"}],
+            "strict_mode": False,
+        }
+        result = aggregate_risk_node(state)
+        # In non-strict mode, suppliers list should NOT be written (only summary)
+        assert "report_hazard_scores" not in result
+
+    def test_report_node_strict_empty_excludes_old_hazard_rows(self):
+        """generate_report_node must use report_hazard_scores, not hazard_scores.
+
+        Strict mode leaves stale entries in hazard_scores (additive reducer).
+        If report_hazard_scores is present and empty, those stale rows must
+        not appear in the rendered report.
+        """
+        from bor_risk.graph import generate_report_node
+
+        old_scores = [
+            {"supplier_name": "OldSupplier", "hazard_type": "earthquake",
+             "score": 0.8, "raw": 500.0},
+        ]
+        state = {
+            "company": "TestCo",
+            "suppliers": [],
+            "hazard_scores": old_scores,   # stale entries remain via additive reducer
+            "report_hazard_scores": [],    # strict aggregate wrote the filtered (empty) list
+            "claims": [],
+            "company_risk_summary": {
+                "company_score": 0.0,
+                "company_band": "Low",
+                "risk_band": "Low",
+                "supplier_risks": [],
+            },
+            "workflow_trace": ["strict mode: no verified suppliers"],
+            "use_llm": False,
+            "_budget_tracker": None,
+        }
+        result = generate_report_node(state)
+        report_text = result.get("report_text", "")
+        # Hazard row format from report.py: "  {supplier_name}: {label} | raw=..."
+        # earthquake label = "Seismic (GEM 2023 PGA, 475-yr RP)"
+        assert "OldSupplier: Seismic (GEM" not in report_text, (
+            "Stale hazard_scores rows must not appear in report when "
+            "report_hazard_scores is present (even if empty)"
+        )

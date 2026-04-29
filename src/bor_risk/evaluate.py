@@ -25,7 +25,7 @@ from langchain_openai import ChatOpenAI
 
 from bor_risk.budget import BudgetTracker
 from bor_risk.graph import run_vcg_graph
-from bor_risk.utils import load_prompts
+from bor_risk.utils import load_prompts, load_reference_set
 
 _GROUND_TRUTH_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "ground_truth"
 _DEFAULT_JUDGE_MODEL = os.getenv(
@@ -160,7 +160,14 @@ def compute_ground_truth_metrics(company: str, state: dict) -> dict:
 def compute_hard_metrics(state: dict) -> dict:
     """Compute deterministic metrics from the run state."""
     suppliers = state.get("suppliers", [])
-    hazard_scores = state.get("hazard_scores", [])
+    # Prefer strict-filtered scores when present (key set by aggregate_risk_node
+    # in strict mode). Use key presence — not truthiness — so an intentional
+    # empty strict result is not overridden by the full accumulated list.
+    hazard_scores = (
+        state["report_hazard_scores"]
+        if "report_hazard_scores" in state
+        else state.get("hazard_scores", [])
+    )
     evidence = state.get("evidence", [])
     budget = state.get("budget_summary", {})
     claims = state.get("claims", [])
@@ -597,6 +604,155 @@ def format_eval_summary(results: list[dict]) -> str:
     lines.append("")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Per-run quality report
+# ---------------------------------------------------------------------------
+
+import sys as _sys
+
+_QUALITY_TARGETS: dict[str, tuple[str, float]] = {
+    "precision":              (">",  0.60),
+    "recall":                 (">",  0.60),
+    "unknown_rate":           ("<",  0.25),
+    "duplicate_rate":         ("<",  0.05),
+    "hazard_informativeness": (">=", 0.50),
+}
+
+
+def print_quality_report(
+    company: str,
+    state: dict,
+    pre_dedup_supplier_count: int | None = None,
+    *,
+    file=None,
+) -> dict:
+    """Print a formatted quality report and return the full metrics dict.
+
+    Parameters
+    ----------
+    company:
+        Company name (used to load ground truth).
+    state:
+        GraphState dict from a completed pipeline run.
+    pre_dedup_supplier_count:
+        Raw supplier count before _deduplicate_suppliers(); taken from
+        state["pre_dedup_supplier_count"] if not supplied explicitly.
+    file:
+        Output stream (default: sys.stdout).
+    """
+    if file is None:
+        file = _sys.stdout
+
+    hard = compute_hard_metrics(state)
+    gt = compute_ground_truth_metrics(company, state)
+    merged = {**hard, **gt}
+
+    # -- pre_dedup_count: caller arg > state field > None ----------------
+    pre_count = pre_dedup_supplier_count
+    if pre_count is None:
+        pre_count = state.get("pre_dedup_supplier_count")
+
+    # Use len(claims) as post-dedup count: claims are created one-per-supplier
+    # at discovery and are never filtered by strict mode, so this is the correct
+    # denominator even when strict mode has reduced state["suppliers"] to a small
+    # verified subset.
+    post_count = len(state.get("claims", []))
+    if pre_count is not None and pre_count > 0:
+        merged["duplicate_rate"] = round((pre_count - post_count) / pre_count, 4)
+    else:
+        merged["duplicate_rate"] = None
+
+    # -- verified_rate_pct -----------------------------------------------
+    total_claims = hard.get("total_claims", 0)
+    verified_count = hard.get("verified_claim_count", 0)
+    merged["verified_rate_pct"] = (
+        round(verified_count / total_claims * 100, 1) if total_claims > 0 else 0.0
+    )
+
+    # -- location_source_mix ---------------------------------------------
+    mix: dict[str, int] = {"llm": 0, "evidence": 0, "fixture": 0}
+    for c in state.get("claims", []):
+        candidates = c.get("location_candidates", [])
+        if not candidates:
+            mix["llm"] += 1
+            continue
+        best = max(candidates, key=lambda lc: lc["confidence"] if isinstance(lc, dict) else lc.confidence)
+        src = best["source"] if isinstance(best, dict) else best.source
+        mix[src] = mix.get(src, 0) + 1
+    merged["location_source_mix"] = mix
+
+    # -- hazard_informativeness (from reference_set metadata) ------------
+    try:
+        rs = load_reference_set()
+        informative = rs.get("metadata", {}).get("informative_hazards", [])
+        merged["hazard_informativeness"] = round(len(informative) / 6, 4)
+    except Exception:
+        merged["hazard_informativeness"] = None
+
+    # -- Print table -----------------------------------------------------
+    W = 80
+    print("=" * W, file=file)
+    print(f"VCG QUALITY REPORT — {company}", file=file)
+    print("=" * W, file=file)
+    print(f"{'Metric':<35} {'Value':>10}  {'Target':>10}  {'Status':>6}", file=file)
+    print("-" * W, file=file)
+
+    def _fmt(v) -> str:
+        if v is None:
+            return "N/A"
+        if isinstance(v, float):
+            return f"{v:.4f}"
+        return str(v)
+
+    def _status(key: str, v) -> str:
+        if v is None or key not in _QUALITY_TARGETS:
+            return "—"
+        op, threshold = _QUALITY_TARGETS[key]
+        if op == ">":
+            ok = v > threshold
+        elif op == ">=":
+            ok = v >= threshold
+        else:
+            ok = v < threshold
+        return "PASS" if ok else "FAIL"
+
+    rows = [
+        ("Precision", "precision", merged.get("precision")),
+        ("Recall", "recall", merged.get("recall")),
+        ("F1 Score", "f1", merged.get("f1")),
+        ("Unknown Rate", "unknown_rate", merged.get("unknown_rate")),
+        ("Duplicate Rate", "duplicate_rate", merged.get("duplicate_rate")),
+        ("Unverified Fraction", "unverified_fraction", merged.get("unverified_fraction")),
+        ("Verified Claims (%)", "verified_rate_pct", merged.get("verified_rate_pct")),
+        ("Claim Support Rate", "claim_support_rate", merged.get("claim_support_rate")),
+        ("Hazard Informativeness", "hazard_informativeness", merged.get("hazard_informativeness")),
+        ("Unique Web Domains", "unique_web_domains", merged.get("unique_web_domains")),
+        ("Supplier Count", "supplier_count", merged.get("supplier_count")),
+    ]
+
+    for label, key, val in rows:
+        target_str = ""
+        if key in _QUALITY_TARGETS:
+            op, thr = _QUALITY_TARGETS[key]
+            target_str = f"{op} {thr}"
+        status = _status(key, val)
+        if key == "location_source_mix":
+            continue
+        print(
+            f"{label:<35} {_fmt(val):>10}  {target_str:>10}  {status:>6}",
+            file=file,
+        )
+
+    loc = merged["location_source_mix"]
+    print(
+        f"{'Location Source Mix':<35} llm={loc['llm']} evidence={loc['evidence']} fixture={loc['fixture']}",
+        file=file,
+    )
+    print("=" * W, file=file)
+
+    return merged
 
 
 # ---------------------------------------------------------------------------

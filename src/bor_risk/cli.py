@@ -79,7 +79,11 @@ def _write_outputs(
         "evidence_packets": state.get("evidence_packets", []),
         "company_risk_summary": state.get("company_risk_summary", {}),
         "workflow_trace": state.get("workflow_trace", []),
+        "hazard_scores": state.get("hazard_scores", []),
+        "pre_dedup_supplier_count": state.get("pre_dedup_supplier_count"),
     }
+    if "report_hazard_scores" in state:
+        graph_data["report_hazard_scores"] = state["report_hazard_scores"]
     if state.get("budget_summary"):
         graph_data["budget_summary"] = state["budget_summary"]
 

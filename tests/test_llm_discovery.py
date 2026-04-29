@@ -41,7 +41,7 @@ class TestDiscoverSuppliersLLM:
         mock_cls = _make_mock_chain(tier1)
 
         with patch("bor_risk.tools.ChatOpenAI", mock_cls):
-            suppliers, edges, evidence = discover_suppliers_llm("ACME", tier_depth=1)
+            suppliers, edges, evidence, _ = discover_suppliers_llm("ACME", tier_depth=1)
 
         assert len(suppliers) == 2
         assert len(edges) == 2
@@ -52,7 +52,7 @@ class TestDiscoverSuppliersLLM:
         mock_cls = _make_mock_chain(tier1)
 
         with patch("bor_risk.tools.ChatOpenAI", mock_cls):
-            _, edges, _ = discover_suppliers_llm("ACME", tier_depth=1)
+            _, edges, _, _ = discover_suppliers_llm("ACME", tier_depth=1)
 
         for edge in edges:
             assert len(edge["evidence_ids"]) >= 1
@@ -62,7 +62,7 @@ class TestDiscoverSuppliersLLM:
         mock_cls = _make_mock_chain(tier1)
 
         with patch("bor_risk.tools.ChatOpenAI", mock_cls):
-            _, _, evidence = discover_suppliers_llm("ACME", tier_depth=1)
+            _, _, evidence, _ = discover_suppliers_llm("ACME", tier_depth=1)
 
         for ev in evidence:
             assert "LLM" in ev["source"]
@@ -74,7 +74,7 @@ class TestDiscoverSuppliersLLM:
         mock_cls = _make_mock_chain(tier1, tier2_steel, tier2_chip)
 
         with patch("bor_risk.tools.ChatOpenAI", mock_cls):
-            suppliers, edges, evidence = discover_suppliers_llm("ACME", tier_depth=2)
+            suppliers, edges, evidence, _ = discover_suppliers_llm("ACME", tier_depth=2)
 
         tiers = {s.tier for s in suppliers}
         assert 1 in tiers
@@ -88,7 +88,7 @@ class TestDiscoverSuppliersLLM:
         mock_cls = _make_mock_chain(tier1)
 
         with patch("bor_risk.tools.ChatOpenAI", mock_cls):
-            suppliers, _, _ = discover_suppliers_llm("ACME", tier_depth=1)
+            suppliers, _, _, _ = discover_suppliers_llm("ACME", tier_depth=1)
 
         for s in suppliers:
             assert -90 <= s.lat <= 90
@@ -141,7 +141,7 @@ class TestSupplierNewFields:
         mock_cls = _make_mock_chain(tier1)
 
         with patch("bor_risk.tools.ChatOpenAI", mock_cls):
-            suppliers, _, _ = discover_suppliers_llm("ACME", tier_depth=1)
+            suppliers, _, _, _ = discover_suppliers_llm("ACME", tier_depth=1)
 
         for s in suppliers:
             assert s.industry != ""
@@ -203,6 +203,94 @@ class TestDeduplication:
         ]
         result = _deduplicate_suppliers(suppliers)
         assert len(result) == 2
+
+    def test_strips_se_suffix(self) -> None:
+        suppliers = [
+            Supplier(name="BASF SE", lat=49.48, lon=8.47, tier=1, confidence=0.9, evidence_ids=["E1"]),
+            Supplier(name="BASF", lat=49.48, lon=8.47, tier=1, confidence=0.7, evidence_ids=["E2"]),
+        ]
+        result = _deduplicate_suppliers(suppliers)
+        assert len(result) == 1
+        assert result[0].confidence == 0.9
+
+    def test_strips_inc_comma(self) -> None:
+        suppliers = [
+            Supplier(name="Applied Materials, Inc.", lat=37.3, lon=-121.9, tier=1, confidence=0.85, evidence_ids=["E1"]),
+            Supplier(name="Applied Materials", lat=37.3, lon=-121.9, tier=1, confidence=0.7, evidence_ids=["E2"]),
+        ]
+        result = _deduplicate_suppliers(suppliers)
+        assert len(result) == 1
+
+    def test_containment_dedup(self) -> None:
+        # "samsung electronics" contains "samsung" — shorter key has 1 token,
+        # so containment is only triggered when shorter has ≥2 tokens.
+        # This case should NOT merge (bare "samsung" is 1 token).
+        suppliers = [
+            Supplier(name="Samsung Electronics", lat=37.3, lon=127.0, tier=1, confidence=0.9, evidence_ids=["E1"]),
+            Supplier(name="Samsung", lat=37.3, lon=127.0, tier=1, confidence=0.7, evidence_ids=["E2"]),
+        ]
+        result = _deduplicate_suppliers(suppliers)
+        # With the 2-token guard, these do NOT merge (shorter key "samsung" = 1 token)
+        assert len(result) == 2
+
+    def test_containment_dedup_two_token(self) -> None:
+        # Both keys have ≥2 tokens and one contains the other → merge
+        suppliers = [
+            Supplier(name="LG Electronics Inc.", lat=37.5, lon=127.0, tier=1, confidence=0.85, evidence_ids=["E1"]),
+            Supplier(name="LG Electronics", lat=37.5, lon=127.0, tier=1, confidence=0.6, evidence_ids=["E2"]),
+        ]
+        result = _deduplicate_suppliers(suppliers)
+        assert len(result) == 1
+
+    def test_highest_confidence_name_preserved(self) -> None:
+        # Higher-confidence entry's name/data is kept
+        suppliers = [
+            Supplier(name="BASF SE", lat=49.48, lon=8.47, tier=1, confidence=0.9, evidence_ids=["E1"]),
+            Supplier(name="BASF", lat=49.0, lon=8.0, tier=1, confidence=0.7, evidence_ids=["E2"]),
+        ]
+        result = _deduplicate_suppliers(suppliers)
+        assert result[0].name == "BASF SE"
+        assert result[0].lat == 49.48
+
+    def test_no_false_positive_short_tokens(self) -> None:
+        # "Applied Materials" and "Advantest" are different — fuzzy < 85
+        suppliers = [
+            Supplier(name="Applied Materials", lat=37.3, lon=-121.9, tier=1, confidence=0.8, evidence_ids=["E1"]),
+            Supplier(name="Advantest Corporation", lat=35.6, lon=139.7, tier=1, confidence=0.8, evidence_ids=["E2"]),
+        ]
+        result = _deduplicate_suppliers(suppliers)
+        assert len(result) == 2
+
+    def test_fuzzy_guard_requires_shorter_two_tokens(self) -> None:
+        # "Samsung" (1-token shorter key) must NOT merge with "Samsung Electronics"
+        # via fuzzy path — the shorter-key ≥2-token guard must block it.
+        suppliers = [
+            Supplier(name="Samsung Electronics", lat=37.3, lon=127.0, tier=1, confidence=0.9, evidence_ids=["E1"]),
+            Supplier(name="Samsung", lat=37.3, lon=127.0, tier=1, confidence=0.7, evidence_ids=["E2"]),
+        ]
+        result = _deduplicate_suppliers(suppliers)
+        names = {s.name for s in result}
+        assert len(result) == 2, f"Expected 2 distinct suppliers, got {names}"
+        assert "Samsung Electronics" in names
+        assert "Samsung" in names
+
+    def test_technology_suffix_not_stripped(self) -> None:
+        # 'technology' is no longer a legal suffix — "Flex Technology" must NOT
+        # strip to "flex" and falsely merge with "Flex Display".
+        suppliers = [
+            Supplier(name="Flex Technology", lat=37.3, lon=-121.9, tier=1, confidence=0.8, evidence_ids=["E1"]),
+            Supplier(name="Flex Display", lat=37.3, lon=-121.9, tier=1, confidence=0.8, evidence_ids=["E2"]),
+        ]
+        result = _deduplicate_suppliers(suppliers)
+        assert len(result) == 2, "Distinct names with 'technology' must not merge"
+
+    def test_pre_dedup_count_returned_in_meta(self) -> None:
+        tier1 = _load_response("acme_tier1.json")
+        mock_cls = _make_mock_chain(tier1)
+        with patch("bor_risk.tools.ChatOpenAI", mock_cls):
+            _, _, _, meta = discover_suppliers_llm("ACME", tier_depth=1)
+        assert "pre_dedup_supplier_count" in meta
+        assert meta["pre_dedup_supplier_count"] >= 1
 
 
 class TestRunGraphWithLLM:

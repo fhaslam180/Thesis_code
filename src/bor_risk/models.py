@@ -292,3 +292,5 @@ class GraphState(TypedDict, total=False):
     mentions: list[dict]          # intermediate: supplier mentions from extraction
     strict_mode: bool             # Condition D: exclude DISPUTED/UNKNOWN claims
     no_verify: bool               # Condition B: skip verify_claims_node
+    pre_dedup_supplier_count: int  # supplier count before _deduplicate_suppliers()
+    report_hazard_scores: list[dict]  # strict-filtered hazard scores for reporting

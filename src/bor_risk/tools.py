@@ -1085,27 +1085,71 @@ def resolve_company_profile(company: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+_LEGAL_SUFFIXES_RE = re.compile(
+    r"[,.]?\s*\b(inc|corp|ltd|se|ag|gmbh|co|plc|llc|nv|sa|sas|kk|spa|bv|oy|ab"
+    r"|corporation|limited)\b\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_legal_suffixes(name: str) -> str:
+    """Lowercase a supplier name and strip trailing legal/generic suffixes."""
+    result = _LEGAL_SUFFIXES_RE.sub("", name.strip()).strip().lower()
+    return result or name.strip().lower()
+
+
+def _dedup_key(name: str) -> str:
+    return _strip_legal_suffixes(name)
+
+
 def _deduplicate_suppliers(
     suppliers: list[Supplier],
 ) -> list[Supplier]:
-    """Merge duplicate suppliers (same name, case-insensitive).
+    """Merge duplicate suppliers using canonical key matching.
 
-    Keeps the entry with the highest confidence and merges evidence_ids
-    from all occurrences.
+    Matching priority:
+    1. Direct key match after legal-suffix stripping.
+    2. Containment: shorter key ⊂ longer key, only when shorter has ≥2 tokens.
+    3. Fuzzy: rapidfuzz token_set_ratio ≥ 85 (skipped if library absent).
+
+    Keeps the highest-confidence entry and unions evidence_ids.
     """
-    seen: dict[str, Supplier] = {}
+    try:
+        from rapidfuzz.fuzz import token_set_ratio as _tsr
+        def _fuzzy_match(a: str, b: str) -> bool:
+            return _tsr(a, b) >= 85
+    except ImportError:
+        def _fuzzy_match(a: str, b: str) -> bool:  # type: ignore[misc]
+            return False
+
+    seen: dict[str, Supplier] = {}   # dedup_key → Supplier
+
+    def _find_existing_key(key: str) -> str | None:
+        if key in seen:
+            return key
+        for ek in seen:
+            # Containment: only merge when the shorter key has ≥2 tokens.
+            short, long = (key, ek) if len(key) <= len(ek) else (ek, key)
+            if short in long and len(short.split()) >= 2:
+                return ek
+        for ek in seen:
+            # Fuzzy: same guard — shorter key must have ≥2 tokens to avoid
+            # single-token names (e.g. "Samsung") merging with longer variants.
+            short = key if len(key) <= len(ek) else ek
+            if len(short.split()) >= 2 and _fuzzy_match(key, ek):
+                return ek
+        return None
 
     for s in suppliers:
-        key = s.name.strip().lower()
-        if key in seen:
-            existing = seen[key]
-            merged_eids = list(
-                dict.fromkeys(existing.evidence_ids + s.evidence_ids)
-            )
+        key = _dedup_key(s.name)
+        matched = _find_existing_key(key)
+        if matched is not None:
+            existing = seen[matched]
+            merged_eids = list(dict.fromkeys(existing.evidence_ids + s.evidence_ids))
             if s.confidence > existing.confidence:
-                seen[key] = s.model_copy(update={"evidence_ids": merged_eids})
+                seen[matched] = s.model_copy(update={"evidence_ids": merged_eids})
             else:
-                seen[key] = existing.model_copy(update={"evidence_ids": merged_eids})
+                seen[matched] = existing.model_copy(update={"evidence_ids": merged_eids})
         else:
             seen[key] = s
 
@@ -1116,11 +1160,12 @@ def discover_suppliers_llm(
     company: str,
     tier_depth: int,
     company_profile: dict | None = None,
-) -> tuple[list[Supplier], list[dict], list[dict]]:
+) -> tuple[list[Supplier], list[dict], list[dict], dict]:
     """Discover suppliers for *company* using GPT-4o structured output.
 
     Makes one LLM call per (parent, tier) pair.  Returns
-    ``(suppliers, edges, evidence)`` with evidence citing the LLM.
+    ``(suppliers, edges, evidence, meta)`` where ``meta`` contains
+    ``pre_dedup_supplier_count`` (count before deduplication).
 
     Parameters
     ----------
@@ -1198,9 +1243,10 @@ def discover_suppliers_llm(
 
         parents = next_parents
 
+    pre_dedup_count = len(all_suppliers)
     all_suppliers = _deduplicate_suppliers(all_suppliers)
 
-    return all_suppliers, all_edges, all_evidence
+    return all_suppliers, all_edges, all_evidence, {"pre_dedup_supplier_count": pre_dedup_count}
 
 
 # ---------------------------------------------------------------------------
@@ -1907,6 +1953,11 @@ _CITY_COORDS: dict[str, tuple[float, float]] = {
     "stockholm": (59.333, 18.065),
 }
 
+# Minimum confidence an evidence-derived location must reach to displace LLM coords.
+LOCATION_ACCEPT_THRESHOLD: float = 0.70
+# Characters searched either side of a city match for the supplier name.
+_LOCATION_PROXIMITY_WINDOW: int = 200
+
 
 def _geocode_simple(place_name: str) -> tuple[float, float] | None:
     """Return (lat, lon) for well-known city names using a lookup table."""
@@ -1925,46 +1976,79 @@ def resolve_locations_for_claims(
 ) -> list["Claim"]:
     """Enrich ``location_candidates`` for each claim from evidence snippets.
 
-    For each claim, scans associated evidence texts for city/country mentions
-    using a simple geocode lookup table.  When a location is found with higher
-    confidence than the existing LLM seed, it is prepended to
-    ``location_candidates``.
-
-    Falls back to the existing LLM seed (source="llm") if no evidence-based
-    location is found.
+    For each claim, scans associated evidence texts for city mentions using
+    proximity-filtered counting: a city is only credited when the supplier name
+    appears within ``_LOCATION_PROXIMITY_WINDOW`` characters of the match.
+    Confidence is derived from mention count (1→0.65, 2→0.85, 3+→0.95) and
+    must reach ``LOCATION_ACCEPT_THRESHOLD`` (0.70) before displacing LLM
+    coordinates.  A single mention is promoted to 0.75 when evidence quality
+    is high (SUPPORTED/WEAK verdict, non-empty supporting_spans) or when the
+    city confirms the LLM-supplied place name.
     """
     from bor_risk.models import LocationCandidate
 
     updated = [c.model_copy(deep=True) for c in claims]
 
     for i, claim in enumerate(updated):
-        found_loc: LocationCandidate | None = None
+        variants = _name_variants(claim.object_entity_id, aliases=claim.aliases)
 
+        # Get the LLM-supplied place name for the single-mention confirmation check.
+        llm_place_name = ""
+        for lc in claim.location_candidates:
+            if lc.source == "llm":
+                llm_place_name = lc.place_name.lower().strip()
+                break
+
+        # Count proximity-filtered city mentions across all evidence texts.
+        city_mentions: dict[str, int] = {}
         for eid in claim.evidence_refs:
             ev_text = evidence_texts.get(eid, "")
             if not ev_text:
                 continue
-
-            # Look for city names in the evidence text
             ev_lower = ev_text.lower()
-            for city, coords in _CITY_COORDS.items():
-                if city in ev_lower:
-                    found_loc = LocationCandidate(
-                        lat=coords[0],
-                        lon=coords[1],
-                        confidence=0.75,
-                        source="evidence",
-                        place_name=city.title(),
-                    )
-                    break
-            if found_loc:
-                break
+            for city in _CITY_COORDS:
+                for m in re.finditer(re.escape(city), ev_lower):
+                    city_pos = m.start()
+                    start = max(0, city_pos - _LOCATION_PROXIMITY_WINDOW)
+                    end = min(len(ev_lower), city_pos + len(city) + _LOCATION_PROXIMITY_WINDOW)
+                    window = ev_lower[start:end]
+                    if _any_variant_in_text(variants, window):
+                        city_mentions[city] = city_mentions.get(city, 0) + 1
 
-        if found_loc:
-            # Prepend evidence-based candidate (higher confidence than LLM seed)
-            new_candidates = [found_loc] + [
-                c for c in claim.location_candidates if c.source != "evidence"
-            ]
-            updated[i] = claim.model_copy(update={"location_candidates": new_candidates})
+        if not city_mentions:
+            continue
+
+        best_city = max(city_mentions, key=lambda c: city_mentions[c])
+        count = city_mentions[best_city]
+
+        if count >= 3:
+            conf = 0.95
+        elif count == 2:
+            conf = 0.85
+        else:
+            # Single mention: default is below threshold; promote only when
+            # evidence quality is high or the city confirms the LLM location.
+            high_quality = (
+                claim.verdict in {"SUPPORTED", "WEAK"}
+                or bool(claim.supporting_spans)
+            )
+            confirms_llm = bool(llm_place_name) and best_city in llm_place_name
+            conf = 0.75 if (high_quality or confirms_llm) else 0.65
+
+        if conf < LOCATION_ACCEPT_THRESHOLD:
+            continue
+
+        coords = _CITY_COORDS[best_city]
+        found_loc = LocationCandidate(
+            lat=coords[0],
+            lon=coords[1],
+            confidence=conf,
+            source="evidence",
+            place_name=best_city.title(),
+        )
+        new_candidates = [found_loc] + [
+            c for c in claim.location_candidates if c.source != "evidence"
+        ]
+        updated[i] = claim.model_copy(update={"location_candidates": new_candidates})
 
     return updated
