@@ -86,6 +86,18 @@ def _build_executive_summary(
             f" The top {len(top_three)} supplier(s) by exposure index are "
             f"{_join_with_and(top_three)}."
         )
+    non_inform = []
+    informative = []
+    if reference_set:
+        metadata = reference_set.get("metadata", {})
+        non_inform = metadata.get("non_informative_hazards", [])
+        informative = metadata.get("informative_hazards", [])
+    smhei_definition = (
+        f"SMHEI = equal-weight arithmetic mean of {len(informative)} informative "
+        "hazard percentile ranks."
+        if informative
+        else "SMHEI = equal-weight arithmetic mean of hazard percentile ranks."
+    )
     overview_paragraph = (
         f"  Overall company exposure is {band.upper()} "
         f"(Supplier Multi-Hazard Exposure Index mean: {score:.4f}). "
@@ -103,7 +115,7 @@ def _build_executive_summary(
         "",
         f"  This report provides a Supplier Multi-Hazard Exposure Index (SMHEI) "
         f"assessment for {company}'s supply chain across {len(suppliers)} supplier(s). "
-        f"SMHEI = equal-weight arithmetic mean of 6 hazard percentile ranks.",
+        f"{smhei_definition}",
         "",
         overview_paragraph,
         "",
@@ -113,16 +125,14 @@ def _build_executive_summary(
     ]
 
     # Non-informative hazard footnote
-    if reference_set:
-        non_inform = reference_set.get("metadata", {}).get("non_informative_hazards", [])
-        if non_inform:
-            lines.append(
-                f"  NOTE: The following hazard(s) were non-informative across the "
-                f"reference corpus and assigned a neutral score of 0.5: "
-                f"{', '.join(non_inform)}. They contribute no discriminating "
-                f"information to the composite index."
-            )
-            lines.append("")
+    if non_inform:
+        lines.append(
+            f"  NOTE: The following hazard(s) were non-informative across the "
+            f"reference corpus and assigned a neutral score of 0.5: "
+            f"{', '.join(non_inform)}. They are excluded from SMHEI, severity "
+            f"rankings, and mitigation generation."
+        )
+        lines.append("")
 
     return lines
 
@@ -132,6 +142,7 @@ def _build_narrative_assessment(
     summary: dict,
     decision: dict,
     actions: list[dict],
+    reference_set: dict | None = None,
 ) -> list[str]:
     """Narrative interpretation section before detailed data tables."""
     supplier_risks = summary.get("supplier_risks", [])
@@ -140,10 +151,18 @@ def _build_narrative_assessment(
         for item in supplier_risks[:5]
     ]
 
+    non_informative = set()
+    if reference_set:
+        non_informative = set(
+            reference_set.get("metadata", {}).get("non_informative_hazards", [])
+        )
+
     by_hazard: dict[str, list[float]] = defaultdict(list)
     high_count = 0
     for hazard in hazards:
         h_type = hazard.get("hazard_type", "unknown")
+        if h_type in non_informative:
+            continue
         score = float(hazard.get("score", 0.0))
         by_hazard[h_type].append(score)
         if hazard.get("level") == "High":
@@ -204,9 +223,15 @@ def _build_narrative_assessment(
 def _build_risk_register_matrix(
     suppliers: list[dict],
     hazards: list[dict],
+    reference_set: dict | None = None,
 ) -> list[str]:
     """Fixed-width text table: supplier rows x hazard columns."""
     hazard_names = [h["name"] for h in load_hazards()]
+    non_informative = set()
+    if reference_set:
+        non_informative = set(
+            reference_set.get("metadata", {}).get("non_informative_hazards", [])
+        )
 
     lookup: dict[tuple[str, str], tuple[int, str]] = {}
     for h in hazards:
@@ -237,8 +262,11 @@ def _build_risk_register_matrix(
     for sname in supplier_names:
         row = "  " + sname.ljust(name_col_w) + "|"
         for hz in hazard_names:
-            s100, lvl = lookup.get((sname, hz), (0, "Low"))
-            cell = f"{s100:>3} {lvl[:3]}"
+            if hz in non_informative:
+                cell = "  N/A"
+            else:
+                s100, lvl = lookup.get((sname, hz), (0, "Low"))
+                cell = f"{s100:>3} {lvl[:3]}"
             row += cell.center(haz_col_w) + "|"
         lines.append(row)
 
@@ -511,6 +539,7 @@ def format_report(state: GraphState) -> str:
         summary=summary,
         decision=decision,
         actions=actions,
+        reference_set=reference_set,
     )
 
     # Evidence Source Summary
@@ -589,7 +618,7 @@ def format_report(state: GraphState) -> str:
                 lines.append(f"    Verified: {verification_url}")
 
     # Risk Register Matrix
-    lines += _build_risk_register_matrix(suppliers, hazards)
+    lines += _build_risk_register_matrix(suppliers, hazards, reference_set=reference_set)
 
     # Hazard Summary
     _HAZARD_LABELS = {
@@ -605,12 +634,19 @@ def format_report(state: GraphState) -> str:
         "--- Hazard Summary ---",
         "  Raw value = physical indicator; H = percentile rank (0-1 relative to reference corpus)",
     ]
+    non_informative = set()
+    if reference_set:
+        non_informative = set(
+            reference_set.get("metadata", {}).get("non_informative_hazards", [])
+        )
     for h in hazards:
         s100 = h.get("score_100", round(h["score"] * 100))
         lvl = h.get("level", "")
         raw = h.get("raw_value", "?")
         raw_str = f"{raw:.4f}" if isinstance(raw, float) else str(raw)
         label = _HAZARD_LABELS.get(h["hazard_type"], h["hazard_type"])
+        if h["hazard_type"] in non_informative:
+            lvl = "Neutral/non-informative"
         lines.append(
             f"  {h['supplier_name']}: {label} | raw={raw_str}, H={h['score']:.4f}, {s100}/100 ({lvl})"
         )

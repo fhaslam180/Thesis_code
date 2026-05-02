@@ -35,6 +35,8 @@ from bor_risk.models import (
     Supplier,
     TierResponse,
 )
+from bor_risk.names import name_variants as _shared_name_variants
+from bor_risk.names import strip_legal_suffixes
 from bor_risk.utils import grid_key, load_prompts, load_reference_set, percentile_rank
 
 logger = logging.getLogger(__name__)
@@ -1086,16 +1088,15 @@ def resolve_company_profile(company: str) -> dict:
 
 
 _LEGAL_SUFFIXES_RE = re.compile(
-    r"[,.]?\s*\b(inc|corp|ltd|se|ag|gmbh|co|plc|llc|nv|sa|sas|kk|spa|bv|oy|ab"
-    r"|corporation|limited)\b\.?\s*$",
+    r"[,.]?\s*\b(inc|incorporated|corp|ltd|se|ag|gmbh|co|plc|llc|nv|sa|sas|kk|spa|bv|oy|ab"
+    r"|corporation|company|limited)\b\.?\s*$",
     re.IGNORECASE,
 )
 
 
 def _strip_legal_suffixes(name: str) -> str:
     """Lowercase a supplier name and strip trailing legal/generic suffixes."""
-    result = _LEGAL_SUFFIXES_RE.sub("", name.strip()).strip().lower()
-    return result or name.strip().lower()
+    return strip_legal_suffixes(name)
 
 
 def _dedup_key(name: str) -> str:
@@ -1250,6 +1251,205 @@ def discover_suppliers_llm(
 
 
 # ---------------------------------------------------------------------------
+# RAG-based supplier discovery
+# ---------------------------------------------------------------------------
+
+
+def generate_discovery_queries(
+    focal_company: str,
+    target_company: str,
+    tier: int,
+    industry: str = "Unknown",
+    products_str: str = "Unknown",
+    n_queries: int = 6,
+) -> list[str]:
+    """Generate targeted web-search queries for supplier discovery."""
+    prompts = load_prompts()
+    prompt_text = prompts["discovery_queries_prompt"].format(
+        focal_company=focal_company,
+        target_company=target_company,
+        n_queries=n_queries,
+        industry=industry,
+        products=products_str,
+        tier=tier,
+    )
+    llm = _make_llm(temperature=0, timeout=30, max_retries=3)
+    raw = llm.invoke([HumanMessage(content=prompt_text)]).content
+    return [q.strip() for q in raw.strip().splitlines() if q.strip()][:n_queries]
+
+
+def extract_suppliers_from_snippets(
+    focal_company: str,
+    target_company: str,
+    snippets: list[dict],
+    tier: int,
+) -> list[Supplier]:
+    """Extract supplier relationships from web snippets using structured LLM output.
+
+    Uses numbered snippet IDs so the LLM cites source_id instead of raw URLs,
+    then validates that evidence_quote is a verbatim substring of the cited snippet.
+    """
+    from bor_risk.models import RAGTierResponse
+
+    if not snippets:
+        return []
+
+    snippet_index: dict[str, dict] = {
+        f"S{i + 1}": {"url": s.get("url", ""), "content": s.get("content", "")}
+        for i, s in enumerate(snippets)
+    }
+    snippets_text = "\n\n".join(
+        f"[{sid}]\nURL: {data['url']}\nText: {data['content']}"
+        for sid, data in snippet_index.items()
+    )
+
+    prompts = load_prompts()
+    prompt_text = prompts["rag_supplier_extraction_prompt"].format(
+        focal_company=focal_company,
+        target_company=target_company,
+        tier=tier,
+        snippets_text=snippets_text[:12000],
+    )
+    llm = _make_llm(temperature=0, timeout=90, max_retries=5)
+    structured = llm.with_structured_output(RAGTierResponse)
+    try:
+        response: RAGTierResponse = structured.invoke([HumanMessage(content=prompt_text)])
+    except Exception:
+        return []
+
+    suppliers: list[Supplier] = []
+    for item in response.suppliers:
+        cited = snippet_index.get(item.source_id, {})
+        real_url = cited.get("url", "")
+        content = cited.get("content", "")
+        if not real_url:
+            continue  # LLM cited non-existent snippet ID — skip
+
+        quote_present = bool(item.evidence_quote and item.evidence_quote in content)
+        eid = f"RAG-{hashlib.sha256(f'{target_company}:{item.name}'.encode()).hexdigest()[:8]}"
+        suppliers.append(Supplier(
+            name=item.name,
+            lat=item.lat,
+            lon=item.lon,
+            tier=tier,
+            confidence=item.confidence if quote_present else 0.0,
+            evidence_ids=[eid],
+            industry=item.industry,
+            product_category=item.product_category,
+            location_description=item.location_description,
+            relationship_type=item.relationship_type,
+            evidence_source="llm_only",
+            source_url=real_url,
+            verification_snippet=item.evidence_quote if quote_present else "",
+        ))
+    return suppliers
+
+
+def discover_suppliers_rag(
+    company: str,
+    tier_depth: int,
+    company_profile: dict | None = None,
+    snapshot_mode: bool = False,
+    n_queries: int = 6,
+    budget=None,
+) -> tuple[list[Supplier], list[dict], list[dict], dict]:
+    """RAG-based supplier discovery. Drop-in replacement for discover_suppliers_llm()
+    when enable_web=True. Returns same (suppliers, edges, evidence, meta) 4-tuple."""
+    from bor_risk.search import search_web, search_web_snapshot
+
+    industry = "Unknown"
+    products_str = "Unknown"
+    if company_profile:
+        industry = company_profile.get("industry", "Unknown")
+        products = company_profile.get("products", [])
+        products_str = ", ".join(products) if products else "Unknown"
+
+    search_fn = search_web_snapshot if snapshot_mode else search_web
+    now = datetime.now(timezone.utc).isoformat()
+
+    all_suppliers: list[Supplier] = []
+    all_edges: list[dict] = []
+    all_evidence: list[dict] = []
+
+    # --- Tier 1 ---
+    queries = generate_discovery_queries(
+        focal_company=company, target_company=company, tier=1,
+        industry=industry, products_str=products_str, n_queries=n_queries,
+    )
+    if budget:
+        budget.record_llm_call(purpose="discovery_queries_tier1")
+
+    snippets: list[dict] = []
+    for q in queries:
+        results = search_fn(q, max_results=5)
+        snippets.extend(results)
+        if budget and results:
+            budget.record_web_query(query=q)
+
+    tier1 = extract_suppliers_from_snippets(
+        focal_company=company, target_company=company, snippets=snippets, tier=1,
+    )
+    if budget:
+        budget.record_llm_call(purpose="supplier_extraction_tier1")
+
+    for s in tier1:
+        eid = s.evidence_ids[0]
+        all_evidence.append({
+            "evidence_id": eid, "source": "tavily_snippet",
+            "description": f"RAG snippet: {s.name} as supplier of {company}",
+            "retrieved_at": now,
+        })
+        all_edges.append({"parent": company, "child": s.name, "evidence_ids": [eid]})
+    all_suppliers.extend(tier1)
+
+    # --- Tier 2: high-confidence tier-1 with validated evidence only ---
+    if tier_depth >= 2:
+        expansion_roots = [
+            s for s in tier1
+            if s.confidence >= 0.7 and s.source_url and s.verification_snippet
+        ]
+        for t1_sup in expansion_roots:
+            queries2 = generate_discovery_queries(
+                focal_company=company, target_company=t1_sup.name, tier=2,
+                industry=industry, products_str=products_str,
+                n_queries=max(3, n_queries // 2),
+            )
+            if budget:
+                budget.record_llm_call(purpose=f"discovery_queries_tier2_{t1_sup.name}")
+
+            snippets2: list[dict] = []
+            for q in queries2:
+                results2 = search_fn(q, max_results=3)
+                snippets2.extend(results2)
+                if budget and results2:
+                    budget.record_web_query(query=q)
+
+            tier2 = extract_suppliers_from_snippets(
+                focal_company=company, target_company=t1_sup.name,
+                snippets=snippets2, tier=2,
+            )
+            if budget:
+                budget.record_llm_call(purpose=f"supplier_extraction_tier2_{t1_sup.name}")
+
+            for s in tier2:
+                eid = s.evidence_ids[0]
+                all_evidence.append({
+                    "evidence_id": eid, "source": "tavily_snippet",
+                    "description": f"RAG snippet: {s.name} as supplier of {t1_sup.name}",
+                    "retrieved_at": now,
+                })
+                all_edges.append({
+                    "parent": t1_sup.name, "child": s.name, "evidence_ids": [eid],
+                })
+            all_suppliers.extend(tier2)
+
+    pre_dedup_count = len(all_suppliers)
+    all_suppliers = _deduplicate_suppliers(all_suppliers)
+
+    return all_suppliers, all_edges, all_evidence, {"pre_dedup_supplier_count": pre_dedup_count}
+
+
+# ---------------------------------------------------------------------------
 # LLM-based mitigation generation
 # ---------------------------------------------------------------------------
 
@@ -1261,6 +1461,9 @@ def _build_risk_context(
 ) -> str:
     """Build a plain-text context block for the mitigation LLM prompt."""
     lines: list[str] = []
+    non_informative = set(
+        load_reference_set().get("metadata", {}).get("non_informative_hazards", [])
+    )
 
     # Company-level summary
     lines.append(f"Company exposure score: {summary.get('company_score', 0):.4f}")
@@ -1284,6 +1487,8 @@ def _build_risk_context(
     # Medium/High hazard scores with metadata
     lines.append("Hazard scores (Medium and High only):")
     for h in hazard_scores:
+        if h.get("hazard_type") in non_informative:
+            continue
         if h.get("level", "Low") not in ("Medium", "High"):
             continue
         meta = h.get("dataset_metadata", {})
@@ -1755,21 +1960,7 @@ def _name_variants(name: str, aliases: list[str] | None = None) -> set[str]:
     from capitalized words (only when ≥3 words to avoid short false positives
     like 'LG'). Curated ``aliases`` from ``claim.aliases`` are always included.
     """
-    name = name.strip()
-    variants: set[str] = {name.lower()}
-    # Strip parenthetical qualifiers like "Co. (Taiwan)"
-    paren_stripped = re.sub(r"\s*\(.*?\)\s*$", "", name).strip().lower()
-    if paren_stripped:
-        variants.add(paren_stripped)
-    # Acronym from ≥3 capitalized words only (avoids "LG", "3M" false positives)
-    cap_words = [w for w in name.split() if w and w[0].isupper()]
-    if len(cap_words) >= 3:
-        variants.add("".join(w[0] for w in cap_words).lower())
-    for alias in aliases or []:
-        alias = alias.strip().lower()
-        if alias:
-            variants.add(alias)
-    return variants
+    return _shared_name_variants(name, aliases=aliases)
 
 
 def _any_variant_in_text(variants: set[str], text_lower: str) -> bool:
@@ -1787,6 +1978,22 @@ def _any_variant_in_text(variants: set[str], text_lower: str) -> bool:
         elif v in text_lower:
             return True
     return False
+
+
+def _first_variant_index(variants: set[str], text_lower: str) -> int:
+    """Return the first text index for any variant, or -1 when absent."""
+    first = -1
+    for v in variants:
+        if not v:
+            continue
+        if len(v) <= 4:
+            match = re.search(r"\b" + re.escape(v) + r"\b", text_lower)
+            idx = match.start() if match else -1
+        else:
+            idx = text_lower.find(v)
+        if idx >= 0 and (first < 0 or idx < first):
+            first = idx
+    return first
 
 
 def verify_claim_against_evidence(
@@ -1840,9 +2047,14 @@ def verify_claim_against_evidence(
     _NEGATION_CUES = frozenset({
         "no longer", "terminated", "dispute", "divest", "ended supply",
         "removed from", "cut ties", "dissolved", "bankruptcy", "ceased",
-        "dropped", "parted ways",
+        "dropped as supplier", "parted ways",
     })
-    has_negation = any(cue in text_lower for cue in _NEGATION_CUES)
+    supplier_idx = _first_variant_index(supplier_variants, text_lower)
+    if supplier_idx >= 0:
+        negation_window = text_lower[max(0, supplier_idx - 300): supplier_idx + 700]
+    else:
+        negation_window = text_lower[:1_000]
+    has_negation = any(cue in negation_window for cue in _NEGATION_CUES)
     if has_negation:
         return VerificationVerdict(
             verdict="DISPUTED",
@@ -1868,7 +2080,7 @@ def verify_claim_against_evidence(
         )
 
     # Build a focused snippet centred on the supplier mention.
-    idx = text_lower.find(supplier_lower)
+    idx = supplier_idx if supplier_idx >= 0 else text_lower.find(supplier_lower)
     if idx >= 0:
         start = max(0, idx - 200)
         end = min(len(evidence_text), idx + 400)

@@ -12,11 +12,11 @@ class TestRunGraph:
     """Tests that exercise the JSON (non-LLM) code path."""
 
     def test_returns_suppliers(self) -> None:
-        state = run_graph("ACME", tier_depth=2)
+        state = run_graph("ACME", tier_depth=2, use_llm=False)
         assert len(state["suppliers"]) > 0
 
     def test_returns_edges_with_evidence(self) -> None:
-        state = run_graph("ACME", tier_depth=2)
+        state = run_graph("ACME", tier_depth=2, use_llm=False)
         assert len(state["edges"]) > 0
         for edge in state["edges"]:
             assert len(edge["evidence_ids"]) >= 1, (
@@ -24,11 +24,11 @@ class TestRunGraph:
             )
 
     def test_returns_evidence(self) -> None:
-        state = run_graph("ACME", tier_depth=2)
+        state = run_graph("ACME", tier_depth=2, use_llm=False)
         assert len(state["evidence"]) > 0
 
     def test_report_text_present(self) -> None:
-        state = run_graph("ACME", tier_depth=2)
+        state = run_graph("ACME", tier_depth=2, use_llm=False)
         assert "SMHEI" in state["report_text"]
 
     def test_different_company(self) -> None:

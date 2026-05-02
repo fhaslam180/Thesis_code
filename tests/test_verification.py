@@ -185,6 +185,27 @@ class TestVerifyClaimAgainstEvidence:
         result = verify_claim_against_evidence(claim, evidence, budget=None)
         assert result.verdict == "DISPUTED"
 
+    def test_alias_variant_allows_brand_name_co_mention(self):
+        """Supplier variants should match evidence that uses a shorter brand name."""
+        claim = _make_claim("Apple", "Pegatron Corporation")
+        evidence = "Pegatron, which is a supplier to Apple, opened a new facility."
+
+        with patch("bor_risk.tools.load_prompts", return_value={}):
+            result = verify_claim_against_evidence(claim, evidence, budget=None)
+        assert result.verdict in {"SUPPORTED", "WEAK"}
+
+    def test_unrelated_negation_does_not_force_disputed(self):
+        """A negative word elsewhere on the page should not override support."""
+        claim = _make_claim("Apple", "TSMC")
+        evidence = (
+            "TSMC is a key supplier for Apple silicon chips. "
+            "A sidebar says another retailer dropped the price of a laptop."
+        )
+
+        with patch("bor_risk.tools.load_prompts", return_value={}):
+            result = verify_claim_against_evidence(claim, evidence, budget=None)
+        assert result.verdict in {"SUPPORTED", "WEAK"}
+
     def test_substring_guard_with_mocked_llm(self):
         """Stage 3: LLM returns SUPPORTED with non-verbatim quote → downgrade to WEAK."""
         from unittest.mock import patch, MagicMock

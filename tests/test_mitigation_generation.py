@@ -74,6 +74,47 @@ class TestGenerateMitigationsLLM:
         assert "Suppliers:" in prompt_text
         assert "Hazard scores (Medium and High only):" in prompt_text
 
+    def test_prompt_excludes_non_informative_hazards(self) -> None:
+        mitigation_response = _load_mitigation_response("acme_mitigations.json")
+        mock_cls = _make_mock_chain(mitigation_response)
+        reference_set = {
+            "metadata": {
+                "non_informative_hazards": ["earthquake"],
+            }
+        }
+        hazard_scores = [
+            {
+                "supplier_name": "ChipWorks",
+                "hazard_type": "earthquake",
+                "score_100": 50,
+                "level": "Medium",
+                "dataset_metadata": {},
+            },
+            {
+                "supplier_name": "ChipWorks",
+                "hazard_type": "drought",
+                "score_100": 80,
+                "level": "High",
+                "dataset_metadata": {},
+            },
+        ]
+
+        with patch("bor_risk.tools.ChatOpenAI", mock_cls):
+            with patch("bor_risk.tools.load_reference_set", return_value=reference_set):
+                generate_mitigations_llm(
+                    company="ACME",
+                    suppliers=[{"name": "ChipWorks"}],
+                    hazard_scores=hazard_scores,
+                    summary={"company_score": 0.5, "company_band": "Medium"},
+                )
+
+        invoke_args = (
+            mock_cls.return_value.with_structured_output.return_value.invoke.call_args[0][0]
+        )
+        prompt_text = invoke_args[0].content
+        assert "ChipWorks / drought" in prompt_text
+        assert "ChipWorks / earthquake" not in prompt_text
+
 
 class TestMitigationNodeMockMode:
     """Graph behavior with use_llm=False skips LLM mitigation generation."""

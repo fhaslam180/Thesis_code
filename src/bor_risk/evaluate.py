@@ -25,6 +25,7 @@ from langchain_openai import ChatOpenAI
 
 from bor_risk.budget import BudgetTracker
 from bor_risk.graph import run_vcg_graph
+from bor_risk.names import canonical_name_key, names_match
 from bor_risk.utils import load_prompts, load_reference_set
 
 _GROUND_TRUTH_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "ground_truth"
@@ -76,6 +77,23 @@ def _normalize_name(name: str) -> str:
     return name.strip().lower().replace(".", "").replace(",", "")
 
 
+def _unique_names(names: list[str]) -> list[str]:
+    """Deduplicate names by canonical supplier key while preserving order."""
+    seen: set[str] = set()
+    unique: list[str] = []
+    for name in names:
+        key = canonical_name_key(name)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(name)
+    return unique
+
+
+def _matches_any_ground_truth(name: str, gt_names: list[str]) -> bool:
+    return any(names_match(name, gt_name) for gt_name in gt_names)
+
+
 # ---------------------------------------------------------------------------
 # Tier 1: Ground-truth metrics
 # ---------------------------------------------------------------------------
@@ -89,18 +107,23 @@ def compute_ground_truth_metrics(company: str, state: dict) -> dict:
     if gt is None:
         return {}
 
-    gt_names: set[str] = set()
-    for name in gt.get("tier_1_suppliers", []):
-        gt_names.add(_normalize_name(name))
-    for name in gt.get("tier_2_suppliers", []):
-        gt_names.add(_normalize_name(name))
+    gt_names = _unique_names(
+        list(gt.get("tier_1_suppliers", [])) + list(gt.get("tier_2_suppliers", []))
+    )
 
     discovered = state.get("suppliers", [])
-    discovered_names = {_normalize_name(s["name"]) for s in discovered}
+    discovered_names = _unique_names([s["name"] for s in discovered])
 
-    tp = discovered_names & gt_names
-    precision = len(tp) / len(discovered_names) if discovered_names else 0.0
-    recall = len(tp) / len(gt_names) if gt_names else 0.0
+    tp_discovered = [
+        name for name in discovered_names
+        if _matches_any_ground_truth(name, gt_names)
+    ]
+    matched_gt = [
+        gt_name for gt_name in gt_names
+        if any(names_match(name, gt_name) for name in discovered_names)
+    ]
+    precision = len(tp_discovered) / len(discovered_names) if discovered_names else 0.0
+    recall = len(matched_gt) / len(gt_names) if gt_names else 0.0
     f1 = (
         2 * precision * recall / (precision + recall)
         if (precision + recall) > 0
@@ -110,9 +133,8 @@ def compute_ground_truth_metrics(company: str, state: dict) -> dict:
     correct_confidences: list[float] = []
     incorrect_confidences: list[float] = []
     for s in discovered:
-        norm = _normalize_name(s["name"])
         conf = float(s.get("confidence", 0.5))
-        if norm in gt_names:
+        if _matches_any_ground_truth(s["name"], gt_names):
             correct_confidences.append(conf)
         else:
             incorrect_confidences.append(conf)
@@ -131,7 +153,7 @@ def compute_ground_truth_metrics(company: str, state: dict) -> dict:
         s for s in discovered if s.get("evidence_source") == "web_verified"
     ]
     wv_correct = sum(
-        1 for s in web_verified if _normalize_name(s["name"]) in gt_names
+        1 for s in web_verified if _matches_any_ground_truth(s["name"], gt_names)
     )
     verification_accuracy = (
         wv_correct / len(web_verified) if web_verified else 0.0
@@ -141,7 +163,7 @@ def compute_ground_truth_metrics(company: str, state: dict) -> dict:
         "has_ground_truth": True,
         "gt_supplier_count": len(gt_names),
         "discovered_count": len(discovered_names),
-        "true_positives": len(tp),
+        "true_positives": len(tp_discovered),
         "precision": round(precision, 4),
         "recall": round(recall, 4),
         "f1": round(f1, 4),

@@ -171,6 +171,43 @@ agent_system_prompt: |
   Your goal: maximise evidence-grounded accuracy within your budget.
   Stop when you have a comprehensive assessment or budget is exhausted.
 
+discovery_queries_prompt: |
+  Generate {n_queries} targeted web search queries to discover suppliers
+  for "{target_company}".
+  Industry: {industry}. Products: {products}. Tier: {tier}.
+
+  Rules:
+  - Each query should target a distinct source type:
+    supplier list, annual report, industry database, news article, regulatory filing
+  - For tier-1: target "{focal_company}" directly
+  - For tier-2: target "{target_company}" (a tier-1 supplier of "{focal_company}"),
+    NOT "{focal_company}" itself
+  - Do NOT generate generic "top suppliers" queries
+  - Return ONLY the query strings, one per line, no numbering or labels
+
+rag_supplier_extraction_prompt: |
+  Below are numbered web snippets about "{target_company}".
+  Extract every supplier or vendor relationship that is explicitly named in the text.
+  Do not infer or speculate.
+
+  For each supplier found:
+  - name: exact company name as it appears in the text
+  - lat / lon: estimated coordinates of their primary facility
+  - location_description: city, country (e.g. "Hsinchu, Taiwan")
+  - confidence: 0.0-1.0 based on how clearly the text asserts the relationship
+  - rationale: one sentence explaining why the text supports this relationship
+  - industry: supplier's sector
+  - product_category: what they supply to {target_company}
+  - relationship_type: raw_material | component | service | logistics
+  - source_id: the snippet ID (e.g. "S1") where this supplier is named
+  - evidence_quote: shortest verbatim phrase from that snippet naming this
+    supplier as a {target_company} supplier or vendor
+
+  Return focal_company="{focal_company}", tier={tier}.
+
+  --- SNIPPETS ---
+  {snippets_text}
+
 judge_prompt: |
   You are evaluating the quality of a supply-chain risk report. Rate each
   dimension 1-5 (1=poor, 5=excellent). Focus on NARRATIVE QUALITY only —

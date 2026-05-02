@@ -89,6 +89,20 @@ class TestGroundTruthMetrics:
         metrics = compute_ground_truth_metrics("Apple", state)
         assert metrics["calibration_gap"] > 0  # correct > incorrect
 
+    def test_supplier_aliases_count_as_true_positives(self):
+        """Legal suffixes, descriptors, and parentheticals should not hide matches."""
+        state = {
+            "suppliers": [
+                {"name": "Samsung Electronics", "confidence": 0.9, "evidence_source": "web_verified"},
+                {"name": "Broadcom Inc.", "confidence": 0.9, "evidence_source": "web_verified"},
+                {"name": "TSMC (Taiwan Semiconductor Manufacturing Company)", "confidence": 0.9, "evidence_source": "web_verified"},
+                {"name": "FakeSupplier", "confidence": 0.5, "evidence_source": "llm_only"},
+            ]
+        }
+        metrics = compute_ground_truth_metrics("Apple", state)
+        assert metrics["true_positives"] == 3
+        assert metrics["precision"] == 0.75
+
 
 class TestHardMetrics:
     def test_basic_metrics(self):

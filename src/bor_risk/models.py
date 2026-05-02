@@ -25,6 +25,7 @@ class Supplier(BaseModel):
     evidence_source: str = "llm_only"  # "llm_only" | "web_verified" | "fixture"
     verification_url: str = ""
     verification_snippet: str = ""
+    source_url: str = ""  # URL of snippet that named this supplier (RAG path)
 
 
 class Evidence(BaseModel):
@@ -118,6 +119,27 @@ class TierResponse(BaseModel):
     parent_company: str
     tier: int
     suppliers: list[LLMSupplier]
+
+
+class RAGSupplier(LLMSupplier):
+    """Supplier extracted from a retrieved web snippet."""
+
+    source_id: str = Field(
+        default="",
+        description="Snippet ID (e.g. 'S3') to be mapped to the real URL by caller",
+    )
+    evidence_quote: str = Field(
+        default="",
+        description="Verbatim text from the snippet naming this supplier",
+    )
+
+
+class RAGTierResponse(BaseModel):
+    """LLM structured output for RAG-based supplier extraction."""
+
+    focal_company: str
+    tier: int
+    suppliers: list[RAGSupplier]
 
 
 class MitigationItem(BaseModel):
@@ -234,6 +256,7 @@ class Claim(BaseModel):
     tier: int = 1
     rationale: str = ""
     verdict_explanation: str = ""
+    discovery_url: str = ""  # seeded from supplier.source_url; used by retrieve_evidence
 
 
 class VerificationVerdict(BaseModel):

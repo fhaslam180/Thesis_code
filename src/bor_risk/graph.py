@@ -40,6 +40,7 @@ from bor_risk.models import (
     LocationCandidate,
     Supplier,
 )
+from bor_risk.names import name_variants, normalize_spacing
 from bor_risk.provenance import ProvenanceExporter
 from bor_risk.report import format_report
 from bor_risk.tools import (
@@ -47,6 +48,7 @@ from bor_risk.tools import (
     compute_hazard,
     compute_risk_summary,
     discover_suppliers_llm,
+    discover_suppliers_rag,
     extract_mentions_from_doc_llm,
     fetch_url_content,
     generate_mitigations_llm,
@@ -78,7 +80,8 @@ _VERDICT_RANK: dict[str, int] = {"SUPPORTED": 0, "DISPUTED": 1, "WEAK": 2, "UNKN
 
 def _supplier_to_claim(supplier: Supplier, company: str, display_num: int) -> Claim:
     """Convert a discovered Supplier into a PROPOSED Claim."""
-    norm = supplier.name.strip().lower()
+    norm = normalize_spacing(supplier.name)
+    aliases = sorted(name_variants(supplier.name) - {norm})
     cid = hashlib.sha256(
         f"{company}|{supplier.name}|SUPPLIES_TO|{supplier.tier}".encode()
     ).hexdigest()[:12]
@@ -95,6 +98,7 @@ def _supplier_to_claim(supplier: Supplier, company: str, display_num: int) -> Cl
         subject_entity_id=company,
         object_entity_id=supplier.name,
         normalized_name=norm,
+        aliases=aliases,
         claim_type="SUPPLIES_TO",
         status="PROPOSED",
         verdict="UNKNOWN",
@@ -102,6 +106,7 @@ def _supplier_to_claim(supplier: Supplier, company: str, display_num: int) -> Cl
         tier=supplier.tier,
         rationale=supplier.verification_snippet or "",
         location_candidates=[loc],
+        discovery_url=supplier.source_url,
     )
 
 
@@ -142,16 +147,25 @@ def discover_claims_node(state: GraphState) -> dict:
 
     pre_dedup_count: int | None = None
     if use_llm:
-        suppliers, edges, evidence, meta = discover_suppliers_llm(
-            company, tier_depth, company_profile=profile or None
-        )
+        enable_web = state.get("enable_web", True)
+        if enable_web:
+            suppliers, edges, evidence, meta = discover_suppliers_rag(
+                company, tier_depth,
+                company_profile=profile or None,
+                snapshot_mode=state.get("snapshot_mode", False),
+                budget=budget,
+            )
+        else:
+            suppliers, edges, evidence, meta = discover_suppliers_llm(
+                company, tier_depth, company_profile=profile or None
+            )
+            if budget:
+                parents_: list[str] = [company]
+                for tier in range(1, tier_depth + 1):
+                    for parent in parents_:
+                        budget.record_llm_call(purpose=f"discover_tier{tier}_{parent}")
+                    parents_ = [s.name for s in suppliers if s.tier == tier]
         pre_dedup_count = meta.get("pre_dedup_supplier_count")
-        if budget:
-            parents: list[str] = [company]
-            for tier in range(1, tier_depth + 1):
-                for parent in parents:
-                    budget.record_llm_call(purpose=f"discover_tier{tier}_{parent}")
-                parents = [s.name for s in suppliers if s.tier == tier]
     else:
         suppliers_path = state.get("suppliers_path")
         suppliers, edges, evidence = load_suppliers(
@@ -236,7 +250,14 @@ def retrieve_evidence_node(state: GraphState) -> dict:
             if not _search_warned:
                 print(f"  [WARNING] Web search failed: {exc}", flush=True)
                 _search_warned = True
-            continue
+            results = []
+
+        # Priority-fetch the page that originally named this supplier (RAG path).
+        discovery_url = getattr(claim, "discovery_url", "") or ""
+        if discovery_url:
+            if not snapshot_mode or discovery_url in url_index:
+                results = [{"url": discovery_url, "title": ""}] + list(results)
+            # If snapshot_mode and URL not in url_index: silently skip (no live fetch).
 
         for r in results:
             url = r.get("url", "")
