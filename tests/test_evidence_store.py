@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from bor_risk.evidence_store import EvidenceStore, _extract_domain, _is_official_domain
+from bor_risk.evidence_store import EvidenceStore, _extract_domain, _classify_source
 from bor_risk.models import EvidencePacket
 
 
@@ -211,14 +211,22 @@ class TestDomainHelpers:
         result = _extract_domain("not-a-url")
         assert isinstance(result, str)
 
-    def test_is_official_domain_gov(self):
-        assert _is_official_domain("sec.gov") is True
+    def test_classify_source_gov(self):
+        q, t = _classify_source("https://sec.gov/filing")
+        assert q == 1.0
+        assert t == "regulatory_filing"
 
-    def test_is_official_domain_edu(self):
-        assert _is_official_domain("mit.edu") is True
+    def test_classify_source_reuters(self):
+        q, t = _classify_source("https://news.reuters.com/article")
+        assert q == 0.8
+        assert t == "news"
 
-    def test_is_official_domain_reuters(self):
-        assert _is_official_domain("news.reuters.com") is True
+    def test_classify_source_unknown(self):
+        q, _ = _classify_source("https://random-blog.xyz/post")
+        assert q == 0.4
 
-    def test_is_official_domain_random(self):
-        assert _is_official_domain("random-blog.xyz") is False
+    def test_classify_source_forum_beats_path(self):
+        # reddit.com with supplier-list path must stay forum
+        q, t = _classify_source("https://reddit.com/supplier-list")
+        assert q == 0.2
+        assert t == "forum"

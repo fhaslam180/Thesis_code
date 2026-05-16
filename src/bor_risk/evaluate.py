@@ -159,6 +159,21 @@ def compute_ground_truth_metrics(company: str, state: dict) -> dict:
         wv_correct / len(web_verified) if web_verified else 0.0
     )
 
+    # text_supported_precision: of SUPPORTED claims, fraction matching ground truth
+    supported_names = {
+        c["object_entity_id"]
+        for c in state.get("claims", [])
+        if c.get("verdict") == "SUPPORTED"
+    }
+    text_supported = [
+        s for s in discovered
+        if any(names_match(s["name"], sup) for sup in supported_names)
+    ]
+    ts_correct = sum(
+        1 for s in text_supported if _matches_any_ground_truth(s["name"], gt_names)
+    )
+    text_supported_precision = ts_correct / len(text_supported) if text_supported else 0.0
+
     return {
         "has_ground_truth": True,
         "gt_supplier_count": len(gt_names),
@@ -172,6 +187,8 @@ def compute_ground_truth_metrics(company: str, state: dict) -> dict:
         "calibration_gap": round(calibration_gap, 4),
         "web_verified_count": len(web_verified),
         "verification_accuracy": round(verification_accuracy, 4),
+        "text_supported_count": len(text_supported),
+        "text_supported_precision": round(text_supported_precision, 4),
     }
 
 
@@ -302,6 +319,95 @@ def compute_hard_metrics(state: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Stage-separated evaluation metrics
+# ---------------------------------------------------------------------------
+
+def compute_stage_metrics(state: dict) -> dict:
+    """Return metrics broken down by pipeline stage. Uses claims, not filtered suppliers."""
+    claims = state.get("claims", [])
+    suppliers = state.get("suppliers", [])   # strict-filtered; used only for report count
+    packets = state.get("evidence_packets", [])
+    n = len(claims)
+
+    # Discovery stage (counts from claims, never strict-filtered suppliers)
+    pre = state.get("pre_dedup_supplier_count") or n
+    rag_seeded = sum(1 for c in claims if c.get("discovery_url"))
+    llm_only_count = sum(1 for c in claims if not c.get("discovery_url"))
+    discovery = {
+        "candidate_count": n,
+        "pre_dedup_count": pre,
+        "dedup_rate": round((pre - n) / pre, 4) if pre > 0 else 0.0,
+        "rag_seeded_count": rag_seeded,
+        "llm_only_count": llm_only_count,
+        "final_report_count": len(suppliers),
+    }
+
+    # Retrieval stage
+    retrieved = sum(1 for c in claims if c.get("status") in ("RETRIEVED", "VERIFIED"))
+    retrieval = {
+        "retrieved_count": retrieved,
+        "retrieval_rate": round(retrieved / n, 4) if n > 0 else 0.0,
+        "mean_evidence_refs": round(
+            sum(len(c.get("evidence_refs", [])) for c in claims) / n, 4
+        ) if n > 0 else 0.0,
+        "unique_domains": len({p.get("domain") for p in packets if p.get("domain")}),
+    }
+
+    # Verification stage
+    supported = sum(1 for c in claims if c.get("verdict") == "SUPPORTED")
+    weak = sum(1 for c in claims if c.get("verdict") == "WEAK")
+    disputed = sum(1 for c in claims if c.get("verdict") == "DISPUTED")
+    unknown = sum(1 for c in claims if c.get("verdict") == "UNKNOWN")
+    verified = sum(1 for c in claims if c.get("status") == "VERIFIED")
+    direction_clear = sum(
+        1 for c in claims
+        if "direction=supplier_to_company" in c.get("verdict_explanation", "")
+        or "direction=company_to_supplier" in c.get("verdict_explanation", "")
+    )
+    supported_claims = [c for c in claims if c.get("verdict") == "SUPPORTED"]
+    quotes_valid = sum(
+        1 for c in supported_claims
+        if any(s.get("quote") for s in c.get("supporting_spans", []))
+    )
+    verification = {
+        "verified_count": verified,
+        "supported": supported,
+        "weak": weak,
+        "disputed": disputed,
+        "unknown": unknown,
+        "supported_rate": round(supported / n, 4) if n > 0 else 0.0,
+        "unknown_rate": round(unknown / n, 4) if n > 0 else 0.0,
+        "quote_valid_rate": (
+            round(quotes_valid / len(supported_claims), 4) if supported_claims else 0.0
+        ),
+        "direction_clear_rate": (
+            round(direction_clear / verified, 4) if verified > 0 else 0.0
+        ),
+    }
+
+    # Source quality stage (from evidence_packets)
+    qualities = [p.get("source_quality", 0.5) for p in packets]
+    type_counts: dict[str, int] = {}
+    for p in packets:
+        stype = p.get("source_type", "unknown")
+        type_counts[stype] = type_counts.get(stype, 0) + 1
+    source = {
+        "mean_source_quality": round(sum(qualities) / len(qualities), 4) if qualities else 0.0,
+        "high_quality_count": sum(1 for q in qualities if q >= 0.7),
+        "low_quality_count": sum(1 for q in qualities if q < 0.4),
+        "total_packets": len(packets),
+        "source_type_counts": type_counts,
+    }
+
+    return {
+        "discovery": discovery,
+        "retrieval": retrieval,
+        "verification": verification,
+        "source_quality": source,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tier 3: LLM-as-judge (narrative quality only)
 # ---------------------------------------------------------------------------
 
@@ -417,6 +523,7 @@ def evaluate_company(
             metrics = {
                 **compute_ground_truth_metrics(company, state),
                 **compute_hard_metrics(state),
+                "stages": compute_stage_metrics(state),
             }
             if not skip_judge:
                 metrics.update(judge_report_quality(company, state))
@@ -773,6 +880,41 @@ def print_quality_report(
         file=file,
     )
     print("=" * W, file=file)
+
+    # Stage Breakdown
+    stages = compute_stage_metrics(state)
+    d = stages["discovery"]
+    r = stages["retrieval"]
+    v = stages["verification"]
+    sq = stages["source_quality"]
+    type_str = " ".join(f"{k}={v2}" for k, v2 in sorted(sq["source_type_counts"].items()))
+    print("", file=file)
+    print("--- Stage Breakdown ---", file=file)
+    print(
+        f"Discovery:    {d['candidate_count']} candidates "
+        f"(pre-dedup={d['pre_dedup_count']}, dedup_rate={d['dedup_rate']:.2f}) "
+        f"| rag_seeded={d['rag_seeded_count']} llm_only={d['llm_only_count']} "
+        f"| report={d['final_report_count']}",
+        file=file,
+    )
+    print(
+        f"Retrieval:    {r['retrieved_count']} retrieved ({r['retrieval_rate']:.1%}) "
+        f"| mean_refs={r['mean_evidence_refs']:.1f} | unique_domains={r['unique_domains']}",
+        file=file,
+    )
+    print(
+        f"Verification: {v['verified_count']} verified "
+        f"| SUPPORTED={v['supported']} WEAK={v['weak']} "
+        f"DISPUTED={v['disputed']} UNKNOWN={v['unknown']} "
+        f"| quotes_valid={v['quote_valid_rate']:.1%} dir_clear={v['direction_clear_rate']:.1%}",
+        file=file,
+    )
+    print(
+        f"Src quality:  mean={sq['mean_source_quality']:.2f} "
+        f"| high={sq['high_quality_count']}(>=0.7) low={sq['low_quality_count']}(<0.4) "
+        f"| types: {type_str or 'none'}",
+        file=file,
+    )
 
     return merged
 

@@ -2,7 +2,8 @@
   "metadata": {
     "collected_at": "2026-04-04T15:01:59.008186+00:00",
     "n_companies": 1,
-    "corpus_note": "study-specific: supplier locations for benchmark companies. Normalization basis \u2014 do NOT regenerate mid-study."
+    "corpus_note": "study-specific: supplier locations for benchmark companies. Normalization basis \u2014 do NOT regenerate mid-study.",
+    "facility_note": "Additional facility-level supplier locations were added on 2026-05-14 to prevent flood normalization from being based only on zero-depth headquarters/city proxies."
   },
   "companies": {
     "Apple": [
@@ -105,6 +106,41 @@
         "name": "Nippon Electric Glass Co., Ltd.",
         "lat": 34.6937,
         "lon": 135.5023
+      },
+      {
+        "name": "TSMC - Tainan Science Park facility reference",
+        "lat": 23.112,
+        "lon": 120.28
+      },
+      {
+        "name": "TSMC - Kaohsiung facility reference",
+        "lat": 22.6273,
+        "lon": 120.3014
+      },
+      {
+        "name": "Samsung Electronics - Thai Nguyen facility reference",
+        "lat": 21.5942,
+        "lon": 105.8482
+      },
+      {
+        "name": "TDK - Xiamen facility reference",
+        "lat": 24.4798,
+        "lon": 118.0894
+      },
+      {
+        "name": "Foxconn - Sriperumbudur facility reference",
+        "lat": 12.9676,
+        "lon": 79.9419
+      },
+      {
+        "name": "Nitto Denko - Onomichi facility reference",
+        "lat": 34.4089,
+        "lon": 133.2058
+      },
+      {
+        "name": "BASF - Ludwigshafen facility reference",
+        "lat": 49.4774,
+        "lon": 8.4452
       }
     ]
   }

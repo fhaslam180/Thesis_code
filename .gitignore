@@ -1,4 +1,5 @@
 outputs/
+.claude/
 __pycache__/
 *.egg-info/
 dist/
@@ -10,3 +11,4 @@ build/
 data/raw/
 data/search_cache/
 data/evidence_cache/
+data/*.db

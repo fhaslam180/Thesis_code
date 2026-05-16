@@ -86,6 +86,7 @@ def _write_outputs(
         graph_data["report_hazard_scores"] = state["report_hazard_scores"]
     if state.get("budget_summary"):
         graph_data["budget_summary"] = state["budget_summary"]
+    graph_data["location_excluded_suppliers"] = state.get("location_excluded_suppliers", [])
 
     graph_path = out_dir / f"{prefix}_graph.json"
     graph_path.write_text(json.dumps(graph_data, indent=2), encoding="utf-8")

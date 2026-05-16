@@ -142,6 +142,32 @@ class RAGTierResponse(BaseModel):
     suppliers: list[RAGSupplier]
 
 
+class NERCandidateResult(BaseModel):
+    """One verified supplier entry returned by the NER-first LLM classifier."""
+
+    candidate_id: str = Field(
+        description="Candidate ID exactly as assigned in the prompt (e.g. 'C3')"
+    )
+    evidence_quote: str = Field(
+        default="",
+        description="Verbatim text from the cited snippet proving the relationship",
+    )
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    product_category: str = Field(default="")
+    location_description: str = Field(default="")
+    lat: float = Field(default=0.0)
+    lon: float = Field(default=0.0)
+    relationship_type: Literal["raw_material", "component", "service", "logistics", ""] = ""
+
+
+class NERExtractionResponse(BaseModel):
+    """LLM structured output for NER-first supplier extraction from snippets."""
+
+    focal_company: str
+    tier: int
+    verified_suppliers: list[NERCandidateResult]
+
+
 class MitigationItem(BaseModel):
     """A single mitigation recommendation from the LLM."""
 
@@ -225,6 +251,8 @@ class EvidencePacket(BaseModel):
     snapshot_path: str | None = None
     quality_signals: dict[str, Any] = Field(default_factory=dict)
     # quality_signals: is_official_domain (bool), is_pdf (bool), word_count (int)
+    source_quality: float = 0.5   # 0.0–1.0; computed by EvidenceStore via _classify_source
+    source_type: str = "unknown"  # human-readable tier label (e.g. "official_report", "news")
 
 
 class LocationCandidate(BaseModel):
@@ -256,6 +284,7 @@ class Claim(BaseModel):
     tier: int = 1
     rationale: str = ""
     verdict_explanation: str = ""
+    best_evidence_quality: float = 0.5  # source_quality of the best-evidence packet; set by verify_claims_node
     discovery_url: str = ""  # seeded from supplier.source_url; used by retrieve_evidence
 
 
@@ -317,3 +346,4 @@ class GraphState(TypedDict, total=False):
     no_verify: bool               # Condition B: skip verify_claims_node
     pre_dedup_supplier_count: int  # supplier count before _deduplicate_suppliers()
     report_hazard_scores: list[dict]  # strict-filtered hazard scores for reporting
+    location_excluded_suppliers: list[dict]  # suppliers dropped for unresolved (0,0) — audit only

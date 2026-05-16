@@ -126,6 +126,10 @@ claim_verification_prompt: |
     * company_to_supplier: the text describes the company sourcing from the supplier
     * unclear: direction is ambiguous
 
+  IMPORTANT: If you cannot determine a clear relationship direction (supplier_to_company or
+  company_to_supplier), return WEAK rather than SUPPORTED, even if both companies are mentioned
+  together in a supply-chain context. Co-mentions alone should be WEAK or UNKNOWN, not SUPPORTED.
+
   IMPORTANT: The supporting_quote must be copied VERBATIM from the evidence text above.
 
 location_extraction_prompt: |
@@ -172,18 +176,22 @@ agent_system_prompt: |
   Stop when you have a comprehensive assessment or budget is exhausted.
 
 discovery_queries_prompt: |
-  Generate {n_queries} targeted web search queries to discover suppliers
-  for "{target_company}".
+  Generate {n_queries} web search queries to find suppliers for "{target_company}".
   Industry: {industry}. Products: {products}. Tier: {tier}.
 
-  Rules:
-  - Each query should target a distinct source type:
-    supplier list, annual report, industry database, news article, regulatory filing
-  - For tier-1: target "{focal_company}" directly
-  - For tier-2: target "{target_company}" (a tier-1 supplier of "{focal_company}"),
-    NOT "{focal_company}" itself
-  - Do NOT generate generic "top suppliers" queries
-  - Return ONLY the query strings, one per line, no numbering or labels
+  Generate queries in EXACTLY this priority order (one per line, most official first):
+  1. Official supplier list or responsibility page for "{target_company}" (year {year})
+  2. Annual report or 10-K supply chain section for "{target_company}" (year {year})
+  3. Sustainability or ESG report vendors/suppliers for "{target_company}"
+  4. Regulatory or procurement filing (SEC/EDGAR) if "{target_company}" is publicly traded
+  5. Industry database or reputable trade press (Bloomberg, Reuters, industry journals)
+  6. News article explicitly stating a supplier relationship
+
+  For tier-1: target "{focal_company}" directly.
+  For tier-2: target "{target_company}" (a tier-1 supplier of "{focal_company}"),
+    NOT "{focal_company}" itself.
+  Do NOT use site: filters unless you know the exact domain.
+  Return ONLY the query strings, one per line, no numbering or labels.
 
 rag_supplier_extraction_prompt: |
   Below are numbered web snippets about "{target_company}".
@@ -202,6 +210,33 @@ rag_supplier_extraction_prompt: |
   - source_id: the snippet ID (e.g. "S1") where this supplier is named
   - evidence_quote: shortest verbatim phrase from that snippet naming this
     supplier as a {target_company} supplier or vendor
+
+  Return focal_company="{focal_company}", tier={tier}.
+
+  --- SNIPPETS ---
+  {snippets_text}
+
+ner_supplier_extraction_prompt: |
+  Below are numbered web snippets about "{target_company}".
+
+  The following candidate organizations were automatically detected in the snippet text.
+  Each has been assigned a candidate ID:
+
+  {candidates_text}
+
+  Your task: from these candidates ONLY, identify which ones are suppliers or vendors
+  to {target_company} based solely on the snippet text.
+
+  Rules:
+  - Return ONLY candidate IDs from the list above. Do NOT add other organizations.
+  - Do NOT use background knowledge — classify only what the text explicitly states.
+  - A candidate is a supplier only if the text EXPLICITLY states it provides goods,
+    components, materials, or services to {target_company}.
+  - evidence_quote must be a verbatim substring of the snippet it came from, and must
+    contain the candidate organization's name or a short alias of it.
+  - relationship_type must be one of: raw_material | component | service | logistics
+  - Omit candidates that are not suppliers; only include verified ones in
+    verified_suppliers.
 
   Return focal_company="{focal_company}", tier={tier}.
 

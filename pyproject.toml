@@ -26,11 +26,15 @@ viz = [
     "networkx>=3.0",
     "matplotlib>=3.7",
 ]
+ner = ["spacy>=3.7,<4"]
+pdf = ["pdfplumber>=0.10"]
 all = [
     "folium>=0.14",
     "networkx>=3.0",
     "matplotlib>=3.7",
     "pytest>=8.0",
+    "spacy>=3.7,<4",
+    "pdfplumber>=0.10",
 ]
 
 [tool.hatch.build.targets.wheel]

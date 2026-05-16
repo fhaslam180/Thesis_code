@@ -43,17 +43,26 @@ class TestGraphTopology:
                     "high_risk_response", "monitoring_response"]:
             assert old not in node_names, f"Old node still present: {old}"
 
-    def test_resolve_locations_fans_out_to_six_scorers(self) -> None:
+    def test_filter_located_fans_out_to_six_scorers(self) -> None:
         g = build_vcg_graph().compile()
         fan_out_targets = {
             edge.target
             for edge in g.get_graph().edges
-            if edge.source == "resolve_locations"
+            if edge.source == "filter_located_suppliers"
         }
         for name in HAZARD_NAMES:
             assert f"score_{name}" in fan_out_targets, (
-                f"resolve_locations doesn't fan out to score_{name}"
+                f"filter_located_suppliers doesn't fan out to score_{name}"
             )
+
+    def test_resolve_locations_goes_to_filter_located(self) -> None:
+        g = build_vcg_graph().compile()
+        targets = {
+            edge.target
+            for edge in g.get_graph().edges
+            if edge.source == "resolve_locations"
+        }
+        assert "filter_located_suppliers" in targets
 
     def test_six_scorers_fan_into_aggregate(self) -> None:
         g = build_vcg_graph().compile()

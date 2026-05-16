@@ -39,12 +39,14 @@ from bor_risk.models import (
     GraphState,
     LocationCandidate,
     Supplier,
+    VerificationVerdict,
 )
 from bor_risk.names import name_variants, normalize_spacing
 from bor_risk.provenance import ProvenanceExporter
 from bor_risk.report import format_report
 from bor_risk.tools import (
     LOCATION_ACCEPT_THRESHOLD,
+    _is_readable_text,
     compute_hazard,
     compute_risk_summary,
     discover_suppliers_llm,
@@ -350,7 +352,7 @@ def extract_mentions_node(state: GraphState) -> dict:
         if not doc_text and packet_dict.get("content_hash"):
             doc_text = _STORE.read_snapshot(EvidencePacket(**packet_dict)) or ""
 
-        if not doc_text:
+        if not _is_readable_text(doc_text):
             continue
 
         mentions = extract_mentions_from_doc_llm(doc_text, company, evidence_id)
@@ -415,6 +417,8 @@ def verify_claims_node(state: GraphState) -> dict:
             supplier_lower = claim.object_entity_id.lower()
             for eid, packet_dict in packets.items():
                 text = _STORE.read_snapshot(EvidencePacket(**packet_dict)) or ""
+                if not _is_readable_text(text):
+                    continue
                 if company_lower in text.lower() and supplier_lower in text.lower():
                     claim = claim.model_copy(
                         update={"evidence_refs": [eid], "status": "RETRIEVED"}
@@ -425,33 +429,82 @@ def verify_claims_node(state: GraphState) -> dict:
             verified_claims.append(claim.model_dump())
             continue
 
-        # Step 3: Iterate all evidence refs, keep best verdict by
-        # SUPPORTED > DISPUTED > WEAK > UNKNOWN.
+        # Step 3: Iterate all evidence refs, keep best verdict with tie-breaking by quality.
+        # Verdict rank: SUPPORTED=0 > DISPUTED=1 > WEAK=2 > UNKNOWN=3.
+        supporting_domains: set[str] = set()
         best_verdict_obj = None
         best_used_eid = ""
+        best_quality = 0.0
 
         for eid in claim.evidence_refs:
             packet_dict = packets.get(eid)
             if not packet_dict:
                 continue
             evidence_text = _STORE.read_snapshot(EvidencePacket(**packet_dict)) or ""
-            if not evidence_text:
+            if not _is_readable_text(evidence_text):
                 continue
 
             verdict_obj = verify_claim_against_evidence(claim, evidence_text, budget)
+            domain = packet_dict.get("domain", "")
+            quality = packet_dict.get("source_quality", 0.5)
 
-            if best_verdict_obj is None or (
-                _VERDICT_RANK[verdict_obj.verdict] < _VERDICT_RANK[best_verdict_obj.verdict]
-            ):
+            if verdict_obj.verdict in ("SUPPORTED", "WEAK") and domain and quality >= 0.5:
+                supporting_domains.add(domain)
+
+            is_better = (
+                best_verdict_obj is None
+                or _VERDICT_RANK[verdict_obj.verdict] < _VERDICT_RANK[best_verdict_obj.verdict]
+                or (
+                    _VERDICT_RANK[verdict_obj.verdict] == _VERDICT_RANK[best_verdict_obj.verdict]
+                    and quality > best_quality
+                )
+            )
+            if is_better:
                 best_verdict_obj = verdict_obj
                 best_used_eid = eid
+                best_quality = quality
 
-            if best_verdict_obj.verdict == "SUPPORTED":
-                break  # Cannot improve further
+            # Early break: current packet gives SUPPORTED from a high-quality source
+            if verdict_obj.verdict == "SUPPORTED" and quality >= 0.7:
+                break
 
         if best_verdict_obj is None:
             verified_claims.append(claim.model_dump())
             continue
+
+        # Corroboration: WEAK + 2 independent quality domains + non-empty quote + clear direction
+        if (best_verdict_obj.verdict == "WEAK"
+                and len(supporting_domains) >= 2
+                and best_verdict_obj.supporting_quote
+                and best_verdict_obj.direction != "unclear"):
+            best_verdict_obj = VerificationVerdict(
+                verdict="SUPPORTED",
+                rationale=(best_verdict_obj.rationale
+                           + f" [corroborated: {len(supporting_domains)} independent sources]"),
+                supporting_quote=best_verdict_obj.supporting_quote,
+                direction=best_verdict_obj.direction,
+            )
+
+        # Direction gate: SUPPORTED + unclear direction → WEAK
+        if best_verdict_obj.verdict == "SUPPORTED" and best_verdict_obj.direction == "unclear":
+            best_verdict_obj = VerificationVerdict(
+                verdict="WEAK",
+                rationale=best_verdict_obj.rationale + " [direction unclear — downgraded]",
+                supporting_quote=best_verdict_obj.supporting_quote,
+                direction="unclear",
+            )
+
+        # Source quality gate: SUPPORTED from low-quality source (< 0.4) → WEAK
+        best_packet = packets.get(best_used_eid, {})
+        best_quality_final = best_packet.get("source_quality", 0.5)
+        if best_verdict_obj.verdict == "SUPPORTED" and best_quality_final < 0.4:
+            best_verdict_obj = VerificationVerdict(
+                verdict="WEAK",
+                rationale=(best_verdict_obj.rationale
+                           + f" [low source quality {best_quality_final:.2f} — capped at WEAK]"),
+                supporting_quote=best_verdict_obj.supporting_quote,
+                direction=best_verdict_obj.direction,
+            )
 
         update: dict = {
             "status": "VERIFIED",
@@ -459,6 +512,7 @@ def verify_claims_node(state: GraphState) -> dict:
             "verdict_explanation": (
                 f"{best_verdict_obj.rationale} [direction={best_verdict_obj.direction}]"
             ),
+            "best_evidence_quality": best_quality_final,
         }
 
         if best_verdict_obj.supporting_quote and best_used_eid:
@@ -609,7 +663,12 @@ def aggregate_risk_node(state: GraphState) -> dict:
             c["object_entity_id"]
             for c in claims
             if c.get("status") == "VERIFIED"
-            and c.get("verdict") in {"SUPPORTED", "WEAK"}
+            and (
+                (c.get("verdict") == "SUPPORTED"
+                 and c.get("best_evidence_quality", 0.5) >= 0.4)
+                or (c.get("verdict") == "WEAK"
+                    and c.get("best_evidence_quality", 0.5) >= 0.5)
+            )
         }
         if not allowed_names:
             return {
@@ -697,6 +756,14 @@ def generate_report_node(state: GraphState) -> dict:
     }
     report_text = format_report(report_state)
 
+    excluded = state.get("location_excluded_suppliers", [])
+    if excluded:
+        names = ", ".join(s.get("name", "unknown") for s in excluded)
+        report_text += (
+            f"\n\nNote: {len(excluded)} supplier(s) excluded from hazard scoring "
+            f"due to unresolved coordinates: {names}"
+        )
+
     result: dict = {
         "llm_mitigations": mitigations,
         "suggested_alternatives": alternatives,
@@ -713,6 +780,66 @@ def export_artifacts_node(state: GraphState) -> dict:
     return {"workflow_trace": ["export_artifacts"]}
 
 
+def filter_verified_suppliers_node(state: GraphState) -> dict:
+    """Node 6b: In strict mode, drop unverified suppliers before location
+    resolution and hazard scoring, so API quota is spent only on verified
+    suppliers. Claims are not touched — they remain available for audit metrics.
+    """
+    suppliers = list(state.get("suppliers", []))
+
+    if not state.get("strict_mode"):
+        return {
+            "suppliers": suppliers,
+            "workflow_trace": ["filter_verified_suppliers(skip: not strict)"],
+        }
+
+    claims = state.get("claims", [])
+    allowed_names: set[str] = {
+        c["object_entity_id"]
+        for c in claims
+        if c.get("status") == "VERIFIED"
+        and (
+            (c.get("verdict") == "SUPPORTED"
+             and c.get("best_evidence_quality", 0.5) >= 0.4)
+            or (c.get("verdict") == "WEAK"
+                and c.get("best_evidence_quality", 0.5) >= 0.5)
+        )
+    }
+
+    pre = len(suppliers)
+    filtered = [s for s in suppliers if s.get("name") in allowed_names]
+    dropped = pre - len(filtered)
+
+    return {
+        "suppliers": filtered,
+        "workflow_trace": [
+            f"filter_verified_suppliers(strict: kept {len(filtered)}, dropped {dropped})"
+        ],
+    }
+
+
+def filter_located_suppliers_node(state: GraphState) -> dict:
+    """Node 7b: Remove suppliers with unresolved (0,0) coordinates before hazard scoring.
+
+    Unresolved suppliers are moved to location_excluded_suppliers for audit;
+    they do not appear in hazard_scores or the risk summary.
+    """
+    suppliers = list(state.get("suppliers", []))
+    located = [s for s in suppliers
+               if not (s.get("lat") == 0.0 and s.get("lon") == 0.0)]
+    excluded = [s for s in suppliers
+                if s.get("lat") == 0.0 and s.get("lon") == 0.0]
+
+    return {
+        "suppliers": located,
+        "location_excluded_suppliers": excluded,
+        "workflow_trace": [
+            f"filter_located_suppliers(kept {len(located)}, "
+            f"dropped {len(excluded)} unresolved)"
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Build and compile
 # ---------------------------------------------------------------------------
@@ -726,8 +853,8 @@ def build_vcg_graph() -> StateGraph:
         START
           → resolve_entity → discover_claims
           → retrieve_evidence → extract_mentions → link_claims
-          → verify_claims → resolve_locations
-          → [score_* fan-out] → aggregate_risk
+          → verify_claims → filter_verified_suppliers → resolve_locations
+          → filter_located_suppliers → [score_* fan-out] → aggregate_risk
           → generate_report → export_artifacts → END
     """
     g = StateGraph(GraphState)
@@ -738,7 +865,9 @@ def build_vcg_graph() -> StateGraph:
     g.add_node("extract_mentions", extract_mentions_node)
     g.add_node("link_claims", link_claims_node)
     g.add_node("verify_claims", verify_claims_node)
+    g.add_node("filter_verified_suppliers", filter_verified_suppliers_node)
     g.add_node("resolve_locations", resolve_locations_node)
+    g.add_node("filter_located_suppliers", filter_located_suppliers_node)
     for name, scorer_fn in _HAZARD_SCORER_NODES.items():
         g.add_node(f"score_{name}", scorer_fn)
     g.add_node("aggregate_risk", aggregate_risk_node)
@@ -751,10 +880,12 @@ def build_vcg_graph() -> StateGraph:
     g.add_edge("retrieve_evidence", "extract_mentions")
     g.add_edge("extract_mentions", "link_claims")
     g.add_edge("link_claims", "verify_claims")
-    g.add_edge("verify_claims", "resolve_locations")
+    g.add_edge("verify_claims", "filter_verified_suppliers")
+    g.add_edge("filter_verified_suppliers", "resolve_locations")
+    g.add_edge("resolve_locations", "filter_located_suppliers")
 
     for name in HAZARD_NAMES:
-        g.add_edge("resolve_locations", f"score_{name}")
+        g.add_edge("filter_located_suppliers", f"score_{name}")
 
     for name in HAZARD_NAMES:
         g.add_edge(f"score_{name}", "aggregate_risk")
@@ -806,6 +937,7 @@ def run_vcg_graph(
         "workflow_trace": [],
         "claims": [],
         "evidence_packets": [],
+        "location_excluded_suppliers": [],
         "_budget_tracker": budget,
     }
     if suppliers_path is not None:

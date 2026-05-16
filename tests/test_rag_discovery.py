@@ -71,7 +71,8 @@ class TestRAGDiscovery:
 
     def test_tier2_gate_high_confidence_expands(self):
         from bor_risk.tools import discover_suppliers_rag
-        high = _make_supplier("TSMC", confidence=0.9)
+        # Use a quality URL (>= 0.5) so the source quality gate passes
+        high = _make_supplier("TSMC", confidence=0.9, source_url="https://bloomberg.com/apple-tsmc")
         with patch("bor_risk.tools.generate_discovery_queries", return_value=["q"]) as mock_gq:
             with patch("bor_risk.search.search_web", return_value=[]):
                 with patch("bor_risk.tools.extract_suppliers_from_snippets",
@@ -96,33 +97,39 @@ class TestRAGDiscovery:
         assert "pre_dedup_supplier_count" in meta
 
     def test_source_id_validated_against_snippet(self):
-        """LLM claiming source_id='S99' (non-existent) must be dropped."""
+        """LLM returning candidate_id not in the index must be dropped."""
         from bor_risk.tools import extract_suppliers_from_snippets
-        from bor_risk.models import RAGTierResponse, RAGSupplier
-        bad = RAGTierResponse(
+        from bor_risk.models import NERCandidateResult, NERExtractionResponse
+        bad = NERExtractionResponse(
             focal_company="Apple", tier=1,
-            suppliers=[RAGSupplier(name="Ghost", lat=0.0, lon=0.0, confidence=0.9,
-                                   rationale="x", source_id="S99",
-                                   evidence_quote="mentioned somewhere")],
+            verified_suppliers=[NERCandidateResult(
+                candidate_id="C99",  # not in candidate_index
+                evidence_quote="TSMC manufactures chips for Apple.",
+                confidence=0.9,
+            )],
         )
-        with patch("bor_risk.tools._make_llm") as mock_llm:
-            mock_llm.return_value.with_structured_output.return_value.invoke.return_value = bad
-            result = extract_suppliers_from_snippets("Apple", "Apple", _SNIPPETS, tier=1)
-        assert result == []  # S99 not in snippet_index → dropped
+        with patch("bor_risk.tools.extract_orgs_from_text", return_value=["TSMC"]):
+            with patch("bor_risk.tools._make_llm") as mock_llm:
+                mock_llm.return_value.with_structured_output.return_value.invoke.return_value = bad
+                result = extract_suppliers_from_snippets("Apple", "Apple", _SNIPPETS, tier=1)
+        assert result == []  # C99 not in candidate_index → dropped
 
     def test_evidence_quote_validated_verbatim(self):
         """A quote that is NOT in the snippet content must result in confidence=0."""
         from bor_risk.tools import extract_suppliers_from_snippets
-        from bor_risk.models import RAGTierResponse, RAGSupplier
-        fabricated = RAGTierResponse(
+        from bor_risk.models import NERCandidateResult, NERExtractionResponse
+        fabricated = NERExtractionResponse(
             focal_company="Apple", tier=1,
-            suppliers=[RAGSupplier(name="TSMC", lat=24.8, lon=121.0, confidence=0.9,
-                                   rationale="x", source_id="S1",
-                                   evidence_quote="this phrase does not appear in the snippet")],
+            verified_suppliers=[NERCandidateResult(
+                candidate_id="C1",  # valid — C1 maps to "TSMC" via mocked extract_orgs
+                evidence_quote="this phrase does not appear in the snippet",
+                confidence=0.9,
+            )],
         )
-        with patch("bor_risk.tools._make_llm") as mock_llm:
-            mock_llm.return_value.with_structured_output.return_value.invoke.return_value = fabricated
-            result = extract_suppliers_from_snippets("Apple", "Apple", _SNIPPETS, tier=1)
+        with patch("bor_risk.tools.extract_orgs_from_text", return_value=["TSMC"]):
+            with patch("bor_risk.tools._make_llm") as mock_llm:
+                mock_llm.return_value.with_structured_output.return_value.invoke.return_value = fabricated
+                result = extract_suppliers_from_snippets("Apple", "Apple", _SNIPPETS, tier=1)
         assert len(result) == 1
         assert result[0].confidence == 0.0
         assert result[0].verification_snippet == ""

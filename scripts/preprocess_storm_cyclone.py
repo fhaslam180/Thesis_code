@@ -32,6 +32,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from bor_risk.utils import grid_key  # noqa: E402 — must use grid_key, not round()
@@ -51,6 +53,14 @@ CREATE TABLE IF NOT EXISTS grid (
 
 def _is_valid(v_kmh: float) -> bool:
     return math.isfinite(v_kmh) and v_kmh >= 0.0
+
+
+def _grid_key_array(values: np.ndarray, decimals: int) -> np.ndarray:
+    factor = 10 ** decimals
+    return (
+        np.floor(np.abs(values) * factor + 0.5).astype(np.int32)
+        * np.where(values >= 0, 1, -1).astype(np.int32)
+    )
 
 
 def _load_netcdf_basin(nc_path: Path) -> dict[tuple[int, int], float]:
@@ -97,21 +107,69 @@ def _load_netcdf_basin(nc_path: Path) -> dict[tuple[int, int], float]:
     return cells
 
 
+def _load_tif_basin(tif_path: Path) -> dict[tuple[int, int], float]:
+    """Load one STORM fixed-return-period GeoTIFF.
+
+    TIFF values are 100-year wind speeds in m/s; runtime stores km/h. Longitudes
+    above 180 degrees are wrapped into the conventional -180..180 range used by
+    supplier coordinates.
+    """
+    try:
+        import rasterio
+        from rasterio.windows import Window
+    except ImportError as e:
+        raise RuntimeError("Install rasterio to preprocess GeoTIFF inputs") from e
+
+    cells: dict[tuple[int, int], float] = {}
+    with rasterio.open(tif_path) as ds:
+        nodata = ds.nodata
+        transform = ds.transform
+        for row_off in range(0, ds.height, 256):
+            height = min(256, ds.height - row_off)
+            window = Window(0, row_off, ds.width, height)
+            arr = ds.read(1, window=window, masked=True)
+            data = np.asarray(arr.filled(np.nan), dtype=np.float32)
+            valid = np.isfinite(data) & (data > 0.0)
+            if nodata is not None and math.isfinite(nodata):
+                valid &= data != nodata
+            if not np.any(valid):
+                continue
+
+            r_idx, c_idx = np.nonzero(valid)
+            vals_kmh = data[r_idx, c_idx].astype(np.float64) * 3.6
+            cols = c_idx.astype(np.float64) + window.col_off + 0.5
+            rows = r_idx.astype(np.float64) + window.row_off + 0.5
+            lon = transform.c + transform.a * cols + transform.b * rows
+            lat = transform.f + transform.d * cols + transform.e * rows
+            lon = np.where(lon > 180.0, lon - 360.0, lon)
+            lat_keys = _grid_key_array(lat, 1)
+            lon_keys = _grid_key_array(lon, 1)
+
+            for la, lo, v in zip(lat_keys, lon_keys, vals_kmh, strict=False):
+                key = (int(la), int(lo))
+                cells[key] = max(cells.get(key, 0.0), float(v))
+    return cells
+
+
 def main(src: Path, out: Path) -> None:
     nc_files = sorted(src.glob("*.nc"))
-    if not nc_files:
-        raise FileNotFoundError(f"No .nc files found in {src}")
+    tif_files = sorted(src.glob("*_100_YR_RP.tif")) + sorted(src.glob("*_100_YR_RP.tiff"))
+    if not nc_files and not tif_files:
+        raise FileNotFoundError(f"No .nc files or *_100_YR_RP.tif files found in {src}")
 
-    logger.info("Found %d NetCDF basin files", len(nc_files))
+    logger.info("Found %d NetCDF basin files and %d 100-year GeoTIFF basin files", len(nc_files), len(tif_files))
     merged: dict[tuple[int, int], float] = {}
 
     skipped_files = 0
-    for nc_path in nc_files:
-        logger.info("Loading %s ...", nc_path.name)
+    for basin_path in [*nc_files, *tif_files]:
+        logger.info("Loading %s ...", basin_path.name)
         try:
-            basin = _load_netcdf_basin(nc_path)
+            if basin_path.suffix.lower() == ".nc":
+                basin = _load_netcdf_basin(basin_path)
+            else:
+                basin = _load_tif_basin(basin_path)
         except Exception as e:
-            logger.warning("Failed to load %s: %s", nc_path.name, e)
+            logger.warning("Failed to load %s: %s", basin_path.name, e)
             skipped_files += 1
             continue
         for key, v in basin.items():

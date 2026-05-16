@@ -72,6 +72,344 @@ def _make_llm(*, temperature: float = 0, timeout: int = 60, max_retries: int = 5
 
 
 # ---------------------------------------------------------------------------
+# NER-first supplier extraction — constants and helpers
+# Setup: python -m spacy download en_core_web_sm  (optional; regex path runs without it)
+# ---------------------------------------------------------------------------
+
+_SUFFIX_RE = re.compile(
+    r"\b([A-Z][A-Za-z&\-]{1,}(?:\s+[A-Z][A-Za-z&\-]{1,}){0,4}"
+    r"(?:\s+(?:Inc|Ltd|Corp|Co|GmbH|AG|SE|plc|LLC|K\.K\.|KK)\.?)?)\b"
+)
+_ACRONYM_RE = re.compile(r"\b[A-Z]{2,8}(?:-[A-Z]{2,4})?\b")
+_COMPANY_SUFFIX_RE = re.compile(
+    r"\b(?:Inc|Ltd|Corp|Co|GmbH|AG|SE|plc|LLC|K\.K\.|KK|NV|SA|SAS|BV|AB)\.?\s*$",
+    re.IGNORECASE,
+)
+
+_JUNK_LOWER: frozenset[str] = frozenset({
+    # generic structural tokens
+    "the", "this", "a", "an", "and", "for",
+    # standalone legal suffix tokens
+    "inc", "ltd", "co", "corp", "company", "group", "llc", "ag", "se", "plc",
+    # document / list headers
+    "supplier", "suppliers", "vendor", "vendors", "customer", "customers",
+    "manufacturer", "manufacturers", "provider", "providers",
+    "list", "pdf", "report", "annual", "fiscal", "year",
+    "member", "members", "partner", "partners", "client", "clients",
+    "name", "primary", "where", "occurs", "clean", "energy", "program",
+    "manufacturing", "chain", "supply", "technology", "enabling", "ports",
+    "export", "provide", "floating", "carbon",
+    # news agency names (appear in Tavily snippets but are not suppliers)
+    "bloomberg", "reuters", "nikkei", "wsj",
+})
+
+_SUPPLIER_TRIGGER_WORDS: frozenset[str] = frozenset({
+    "supplier", "vendor", "manufactur", "supply", "source", "procure",
+    "component", "material", "provides", "deliver", "contract",
+})
+
+_SUPPLIER_LIST_CONTEXT_RE = re.compile(
+    r"\b(?:"
+    r"supplier\s+(?:list|lists|responsibility|directory)"
+    r"|list\s+of\s+suppliers"
+    r"|suppliers?\s+list"
+    r"|vendor\s+list"
+    r"|supply\s+chain\s+(?:report|list|directory)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_LEGAL_SUFFIX_ANYWHERE_RE = re.compile(
+    r"\b(?:Co\.?,?\s+Ltd\.?|Company\s+Limited|Incorporated|Corporation|Limited|Ltd|Inc|Corp|Co|"
+    r"LLC|GmbH|AG|SE|plc|NV|SA|SAS|BV|AB|K\.K\.|KK)\.?",
+    re.IGNORECASE,
+)
+
+_HEADER_PHRASES: frozenset[str] = frozenset({
+    "clean energy program supplier",
+    "supplier name primary locations where",
+    "primary locations where manufacturing",
+    "apple occurs supplier name apple",
+    "manufacturing for apple occurs",
+    "bangkok thailand supplier list",
+    "electronic component suppliers",
+    "contract manufacturers",
+    "supply chain report",
+    "name brand",
+})
+
+_HEADER_TOKENS: frozenset[str] = frozenset({
+    "supplier", "suppliers", "name", "primary", "locations", "where", "manufacturing",
+    "occurs", "fiscal", "year", "clean", "energy", "program", "list", "report",
+    "component", "components", "contract", "manufacturer", "manufacturers",
+    "chain", "supply", "brand",
+})
+
+_LOCATION_TOKENS: frozenset[str] = frozenset({
+    "amazonas", "ayutthaya", "bangkok", "brazil", "bac", "california", "cambodia",
+    "cebu", "china", "chongqing", "chubu", "czech", "dongguan", "fukui",
+    "fukushima", "gifu", "guangdong", "guangxi", "gyeonggi", "henan",
+    "hokkaido", "hunan", "india", "israel", "ishikawa", "japan", "jeollabuk",
+    "jiangsu", "kagoshima", "karnataka", "korea", "kyoto", "lopburi",
+    "mainland", "malaysia", "mexico", "miyagi", "miyazaki", "nadu", "nagano",
+    "nang", "niigata", "okayama", "penang", "penh", "phnom", "philippines",
+    "republic", "saga", "seoul", "shandong", "shanghai", "shiga", "shenzhen",
+    "shizuoka", "sichuan", "singapore", "sonora", "south", "states", "taichung",
+    "taiwan", "tamil", "thailand", "tianjin", "toyama", "united", "usa",
+    "vietnam", "yamagata", "zhejiang", "zlin",
+})
+
+_BAD_LAST_TOKENS: frozenset[str] = frozenset({
+    "program", "programs", "initiative", "initiatives",
+    "association", "associations", "council", "councils",
+    "agency", "agencies", "bureau", "administration",
+    "committee", "committees", "ministry",
+    "coalition", "alliance",
+})
+
+_CORPORATE_SIGNAL_TOKENS: frozenset[str] = frozenset({
+    "battery", "chemical", "communications", "computer", "display", "electric",
+    "electrical", "electronic", "electronics", "industry", "industrial",
+    "logic", "manufacturing", "material", "materials", "metal", "microelectronics",
+    "optics", "precision", "semiconductor", "semiconductors", "systems",
+    "technology", "technologies",
+})
+
+MAX_CANDIDATES = 60
+
+
+@lru_cache(maxsize=1)
+def _get_spacy_nlp():
+    import spacy  # noqa: PLC0415
+    return spacy.load("en_core_web_sm")
+
+
+def extract_orgs_from_text(text: str) -> list[str]:
+    """Hybrid ORG extraction: spaCy NER + capitalized-suffix regex + acronym regex.
+
+    Both sources always run. spaCy catches named entities; regex catches acronyms
+    (TSMC, CATL) and corporate names that spaCy misses. Results are merged and
+    deduplicated in insertion order.
+    """
+    seen: dict[str, None] = {}
+    try:
+        nlp = _get_spacy_nlp()
+        doc = nlp(text[:50_000])
+        for ent in doc.ents:
+            if ent.label_ == "ORG":
+                seen[ent.text.strip()] = None
+    except (ImportError, OSError):
+        pass  # spaCy unavailable — regex paths below still run
+
+    for m in _SUFFIX_RE.finditer(text):
+        seen[m.group().strip()] = None
+    for m in _ACRONYM_RE.finditer(text):
+        seen[m.group().strip()] = None
+
+    return list(seen)
+
+
+def _has_company_suffix(org: str) -> bool:
+    """Return True if org ends with a recognised legal/corporate suffix."""
+    return bool(_COMPANY_SUFFIX_RE.search(org))
+
+
+def _canonical_token(token: str) -> str:
+    return re.sub(r"[^a-z0-9&]+", "", token.lower())
+
+
+def _clean_supplier_candidate_name(org: str) -> str:
+    """Trim table/list extraction artifacts from a supplier candidate name."""
+    cleaned = " ".join(org.replace("\n", " ").split()).strip(" ,;:-")
+    if not cleaned:
+        return ""
+
+    # Apple supplier-list PDFs often flatten rows into:
+    #   Supplier Name Guangdong, Jiangsu China mainland
+    # Keep the legal name and drop trailing location text after a legal suffix.
+    matches = list(_LEGAL_SUFFIX_ANYWHERE_RE.finditer(cleaned))
+    usable_matches = [
+        m for m in matches
+        if cleaned[:m.start()].strip(" ,;:-")
+    ]
+    if usable_matches:
+        cleaned = cleaned[:usable_matches[0].end()].strip(" ,;:-")
+
+    # If PDF text glued leading locations to a supplier name, drop location
+    # tokens before the first non-location term.
+    tokens = cleaned.split()
+    while len(tokens) > 1 and _canonical_token(tokens[0]) in _LOCATION_TOKENS:
+        tokens.pop(0)
+    cleaned = " ".join(tokens).strip(" ,;:-")
+
+    return cleaned
+
+
+def _is_location_or_header_name(org: str) -> bool:
+    """Reject table headers, list labels, and location-only spans."""
+    normalized = " ".join(_canonical_token(t) for t in org.split())
+    tokens = [t for t in normalized.split() if t]
+    if not tokens:
+        return True
+    if normalized in _HEADER_PHRASES:
+        return True
+    if tokens[-1] in _BAD_LAST_TOKENS:
+        return True
+    if all(t in _LOCATION_TOKENS for t in tokens):
+        return True
+    if all(t in _HEADER_TOKENS or t in _LOCATION_TOKENS for t in tokens):
+        return True
+    return False
+
+
+def _has_supplier_name_signal(org: str) -> bool:
+    """Return True when a name has a company-like lexical signal."""
+    normalized_tokens = {_canonical_token(t) for t in org.split()}
+    return (
+        bool(_ACRONYM_RE.fullmatch(org))
+        or bool(_LEGAL_SUFFIX_ANYWHERE_RE.search(org))
+        or bool(normalized_tokens & _CORPORATE_SIGNAL_TOKENS)
+    )
+
+
+def _is_valid_supplier_candidate(org: str, *, list_context: bool = False) -> bool:
+    """Conservative filter before assigning candidate IDs."""
+    if len(org) < 3:
+        return False
+    lower = org.lower()
+    if lower in _JUNK_LOWER:
+        return False
+    if lower.endswith("-based"):
+        return False
+    if _is_location_or_header_name(org):
+        return False
+    if list_context and not _has_supplier_name_signal(org):
+        return False
+    return True
+
+
+def _score_candidate_proximity(org: str, content: str) -> int:
+    """Count supplier trigger words within ±100 chars of each occurrence of org."""
+    content_lower = content.lower()
+    org_lower = org.lower()
+    score = 0
+    start = 0
+    while True:
+        idx = content_lower.find(org_lower, start)
+        if idx == -1:
+            break
+        window = content_lower[max(0, idx - 100): idx + len(org_lower) + 100]
+        score += sum(1 for t in _SUPPLIER_TRIGGER_WORDS if t in window)
+        start = idx + 1
+    return score
+
+
+def _quote_mentions_candidate(org_name: str, quote: str) -> bool:
+    """Return True if the quote contains the candidate org name or a recognized alias.
+
+    Checks (in order):
+    1. org_name appears as a literal substring of the quote.
+    2. The suffix-stripped form appears as a substring.
+    3. Any substantive token (length ≥ 4) from the stripped form appears in the
+       quote — this handles "Samsung" matching "Samsung Electronics Co., Ltd."
+    """
+    from bor_risk.names import strip_legal_suffixes as _sls
+    quote_lower = quote.lower()
+    if org_name.lower() in quote_lower:
+        return True
+    stripped = _sls(org_name)
+    if stripped and stripped in quote_lower:
+        return True
+    tokens = stripped.split() if stripped else org_name.lower().split()
+    return any(len(tok) >= 4 and tok in quote_lower for tok in tokens)
+
+
+def _is_supplier_list_source(url: str, content: str, target_company: str) -> bool:
+    """Return True when a source looks like an official supplier-list context.
+
+    Supplier lists are structured evidence: once the document context establishes
+    "this is TargetCo's supplier list", listed organisation names can seed
+    claims even when the local sentence does not say "X supplies TargetCo".
+    Forum/community pages are explicitly excluded even if the path says
+    "supplier-list".
+    """
+    from bor_risk.evidence_store import _classify_source
+
+    quality, source_type = _classify_source(url)
+    if source_type == "forum":
+        return False
+
+    haystack = f"{url}\n{content[:3000]}"
+    if not _SUPPLIER_LIST_CONTEXT_RE.search(haystack):
+        return False
+
+    target_norm = target_company.lower()
+    if target_norm and target_norm not in haystack.lower():
+        return False
+
+    return quality >= 0.7 or source_type == "official_report_candidate"
+
+
+def _supplier_list_context_quote(org_name: str, content: str) -> str:
+    """Return an exact substring anchoring a listed organisation to list context."""
+    content_lower = content.lower()
+    org_lower = org_name.lower()
+    idx = content_lower.find(org_lower)
+    if idx == -1:
+        return ""
+
+    line_start = content.rfind("\n", 0, idx) + 1
+    line_end = content.find("\n", idx)
+    if line_end == -1:
+        line_end = len(content)
+
+    # Prefer a nearby preceding supplier-list heading if it keeps the quote
+    # compact enough to remain readable in reports.
+    context_start = line_start
+    prefix_start = max(0, idx - 800)
+    prefix = content[prefix_start:idx]
+    matches = list(_SUPPLIER_LIST_CONTEXT_RE.finditer(prefix))
+    if matches:
+        heading_idx = prefix_start + matches[-1].start()
+        heading_line_start = content.rfind("\n", 0, heading_idx) + 1
+        if line_end - heading_line_start <= 800:
+            context_start = heading_line_start
+
+    return content[context_start:line_end].strip()
+
+
+def _supplier_from_list_candidate(
+    *,
+    target_company: str,
+    org_name: str,
+    tier: int,
+    source_url: str,
+    content: str,
+) -> Supplier | None:
+    """Create a supplier seed from a structured supplier-list source."""
+    quote = _supplier_list_context_quote(org_name, content)
+    if not quote or not _quote_mentions_candidate(org_name, quote):
+        return None
+
+    eid = f"RAG-{hashlib.sha256(f'{target_company}:{org_name}'.encode()).hexdigest()[:8]}"
+    return Supplier(
+        name=org_name,
+        lat=0.0,
+        lon=0.0,
+        tier=tier,
+        confidence=0.8,
+        evidence_ids=[eid],
+        industry="",
+        product_category="",
+        location_description="",
+        relationship_type="",
+        evidence_source="llm_only",
+        source_url=source_url,
+        verification_snippet=quote,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Score normalisation
 # ---------------------------------------------------------------------------
 
@@ -124,23 +462,30 @@ def _urlopen_with_ssl_fallback(url: str, timeout: int = 15) -> bytes:
     Some local environments (e.g. macOS) fail CA verification for
     certain HTTPS endpoints.  When that happens, retry once with an
     unverified context so the agent still returns real data.
-    HTTP 429 responses are retried with exponential backoff (5, 10, 20 seconds).
+    HTTP 429 responses are retried respecting the Retry-After header when present
+    (integer-seconds form only; HTTP-date values fall back to exponential backoff).
+    Max attempts is controlled by OPEN_METEO_MAX_ATTEMPTS (default 4).
     Re-raises non-SSL, non-429 errors so callers can apply their own fallback.
     """
-    import time as _time
-    max_attempts = 4
+    max_attempts = _OPEN_METEO_MAX_ATTEMPTS
     for attempt in range(max_attempts):
         try:
             with urllib.request.urlopen(url, timeout=timeout) as resp:
                 return resp.read()
         except urllib.error.HTTPError as e:
             if e.code == 429 and attempt < max_attempts - 1:
-                delay = 5 * (2 ** attempt)  # 5, 10, 20 seconds
+                retry_after = e.headers.get("Retry-After", None) if e.headers else None
+                try:
+                    delay = int(retry_after) if retry_after else 5 * (2 ** attempt)
+                except (ValueError, TypeError):
+                    # Retry-After can also be an HTTP-date string; fall back to backoff.
+                    delay = 5 * (2 ** attempt)
+                delay = min(delay, 120)
                 logger.warning(
                     "Rate limited (429); retrying in %ds (%d/%d)",
                     delay, attempt + 1, max_attempts - 1,
                 )
-                _time.sleep(delay)
+                time.sleep(delay)
                 continue
             raise
         except urllib.error.URLError as e:
@@ -195,6 +540,7 @@ _api_cache_lock = threading.Lock()
 _api_cache: dict[str, float] | None = None   # loaded lazily
 
 _OPEN_METEO_MIN_INTERVAL: float = float(_os.environ.get("OPEN_METEO_MIN_INTERVAL", "1.0"))
+_OPEN_METEO_MAX_ATTEMPTS: int = int(_os.environ.get("OPEN_METEO_MAX_ATTEMPTS", "4"))
 _open_meteo_ratelimit_lock = threading.Lock()
 _open_meteo_last_t: float = 0.0
 
@@ -1272,6 +1618,7 @@ def generate_discovery_queries(
         industry=industry,
         products=products_str,
         tier=tier,
+        year=datetime.now(timezone.utc).year - 1,
     )
     llm = _make_llm(temperature=0, timeout=30, max_retries=3)
     raw = llm.invoke([HumanMessage(content=prompt_text)]).content
@@ -1284,12 +1631,18 @@ def extract_suppliers_from_snippets(
     snippets: list[dict],
     tier: int,
 ) -> list[Supplier]:
-    """Extract supplier relationships from web snippets using structured LLM output.
+    """NER-first supplier extraction from Tavily snippets.
 
-    Uses numbered snippet IDs so the LLM cites source_id instead of raw URLs,
-    then validates that evidence_quote is a verbatim substring of the cited snippet.
+    Extracts candidate ORG entities via hybrid NER (spaCy + regex), assigns
+    deterministic candidate IDs, then sends only those IDs to the LLM for
+    relationship classification. The LLM cannot generate names not found in
+    the retrieved text. Three Python gates validate each LLM result:
+      1. candidate_id must be in the candidate index
+      2. evidence_quote must be a verbatim substring of the cited snippet
+      3. evidence_quote must contain the candidate org name (or alias)
     """
-    from bor_risk.models import RAGTierResponse
+    from bor_risk.models import NERExtractionResponse
+    from bor_risk.names import canonical_name_key, names_match
 
     if not snippets:
         return []
@@ -1298,50 +1651,153 @@ def extract_suppliers_from_snippets(
         f"S{i + 1}": {"url": s.get("url", ""), "content": s.get("content", "")}
         for i, s in enumerate(snippets)
     }
+
+    # Step 1: hybrid extraction → clean → dedup → proximity rank → cap
+    seen_keys: set[tuple[str, str]] = set()
+    scored: list[tuple[int, str, str]] = []  # (score, org, sid)
+
+    list_context_by_sid: dict[str, bool] = {
+        sid: _is_supplier_list_source(data["url"], data["content"], target_company)
+        for sid, data in snippet_index.items()
+    }
+
+    for sid, data in snippet_index.items():
+        content = data["content"]
+        list_context = list_context_by_sid.get(sid, False)
+        for raw_org in extract_orgs_from_text(content):
+            org = _clean_supplier_candidate_name(raw_org)
+            if not _is_valid_supplier_candidate(org, list_context=list_context):
+                continue
+            if org.lower() in {focal_company.lower(), target_company.lower()}:
+                continue
+            if names_match(org, focal_company) or names_match(org, target_company):
+                continue
+            key = (canonical_name_key(org), sid)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            score = _score_candidate_proximity(org, content)
+            # Drop zero-proximity candidates that are neither acronyms nor have
+            # a company suffix — likely generic capitalized phrases from the
+            # regex. Supplier-list sources are structured evidence, so listed
+            # proper nouns may be valid even without local trigger words.
+            if (score == 0
+                    and not list_context
+                    and not _ACRONYM_RE.fullmatch(org)
+                    and not _has_company_suffix(org)):
+                continue
+            scored.append((score, org, sid))
+
+    scored.sort(key=lambda x: -x[0])
+    scored = scored[:MAX_CANDIDATES]
+
+    if not scored:
+        return []
+
+    # Step 2: assign deterministic candidate IDs
+    candidate_index: dict[str, tuple[str, str]] = {}
+    for i, (_, org, sid) in enumerate(scored, start=1):
+        candidate_index[f"C{i}"] = (org, sid)
+
+    # Step 2b: structured supplier-list mode. Official supplier lists can name
+    # suppliers as rows/items under a document-level supplier-list heading,
+    # without prose that says "X supplies TargetCo" beside every name.
+    list_suppliers: list[Supplier] = []
+    list_candidate_ids: set[str] = set()
+    seen_supplier_keys: set[str] = set()
+    for cid, (org, sid) in candidate_index.items():
+        if not list_context_by_sid.get(sid, False):
+            continue
+        data = snippet_index[sid]
+        supplier = _supplier_from_list_candidate(
+            target_company=target_company,
+            org_name=org,
+            tier=tier,
+            source_url=data["url"],
+            content=data["content"],
+        )
+        if supplier is None:
+            continue
+        key = canonical_name_key(supplier.name)
+        if key in seen_supplier_keys:
+            continue
+        seen_supplier_keys.add(key)
+        list_candidate_ids.add(cid)
+        list_suppliers.append(supplier)
+
+    llm_candidate_ids = [
+        cid for cid in candidate_index
+        if cid not in list_candidate_ids
+    ]
+    if not llm_candidate_ids:
+        return list_suppliers
+
+    # Step 3: single batched LLM call
+    candidate_lines: list[str] = []
+    for cid in llm_candidate_ids:
+        org, sid = candidate_index[cid]
+        candidate_lines.append(f"{cid}: {org} (from {sid})")
+    candidates_text = "\n".join(candidate_lines)
     snippets_text = "\n\n".join(
         f"[{sid}]\nURL: {data['url']}\nText: {data['content']}"
         for sid, data in snippet_index.items()
     )
-
     prompts = load_prompts()
-    prompt_text = prompts["rag_supplier_extraction_prompt"].format(
+    prompt_text = prompts["ner_supplier_extraction_prompt"].format(
         focal_company=focal_company,
         target_company=target_company,
         tier=tier,
+        candidates_text=candidates_text,
         snippets_text=snippets_text[:12000],
     )
     llm = _make_llm(temperature=0, timeout=90, max_retries=5)
-    structured = llm.with_structured_output(RAGTierResponse)
+    structured = llm.with_structured_output(NERExtractionResponse)
     try:
-        response: RAGTierResponse = structured.invoke([HumanMessage(content=prompt_text)])
+        response: NERExtractionResponse = structured.invoke([HumanMessage(content=prompt_text)])
     except Exception:
         return []
 
-    suppliers: list[Supplier] = []
-    for item in response.suppliers:
-        cited = snippet_index.get(item.source_id, {})
+    # Step 4: three-gate validation
+    suppliers: list[Supplier] = list_suppliers
+    for item in response.verified_suppliers:
+        # Gate 1: candidate_id must be in our index
+        if item.candidate_id not in candidate_index or item.candidate_id in list_candidate_ids:
+            continue
+        org_name, sid = candidate_index[item.candidate_id]
+        result_key = canonical_name_key(org_name)
+        if result_key in seen_supplier_keys:
+            continue
+        cited = snippet_index.get(sid, {})
         real_url = cited.get("url", "")
         content = cited.get("content", "")
         if not real_url:
-            continue  # LLM cited non-existent snippet ID — skip
+            continue
 
-        quote_present = bool(item.evidence_quote and item.evidence_quote in content)
-        eid = f"RAG-{hashlib.sha256(f'{target_company}:{item.name}'.encode()).hexdigest()[:8]}"
+        # Gate 2: quote must appear verbatim in the cited snippet
+        quote = item.evidence_quote or ""
+        quote_in_content = bool(quote and quote in content)
+
+        # Gate 3: candidate name (or alias) must appear in the quote
+        name_in_quote = quote_in_content and _quote_mentions_candidate(org_name, quote)
+
+        quote_valid = quote_in_content and name_in_quote
+        eid = f"RAG-{hashlib.sha256(f'{target_company}:{org_name}'.encode()).hexdigest()[:8]}"
         suppliers.append(Supplier(
-            name=item.name,
+            name=org_name,
             lat=item.lat,
             lon=item.lon,
             tier=tier,
-            confidence=item.confidence if quote_present else 0.0,
+            confidence=item.confidence if quote_valid else 0.0,
             evidence_ids=[eid],
-            industry=item.industry,
+            industry="",
             product_category=item.product_category,
             location_description=item.location_description,
             relationship_type=item.relationship_type,
             evidence_source="llm_only",
             source_url=real_url,
-            verification_snippet=item.evidence_quote if quote_present else "",
+            verification_snippet=quote if quote_valid else "",
         ))
+        seen_supplier_keys.add(result_key)
     return suppliers
 
 
@@ -1404,9 +1860,13 @@ def discover_suppliers_rag(
 
     # --- Tier 2: high-confidence tier-1 with validated evidence only ---
     if tier_depth >= 2:
+        from bor_risk.evidence_store import _classify_source
         expansion_roots = [
             s for s in tier1
-            if s.confidence >= 0.7 and s.source_url and s.verification_snippet
+            if (s.confidence >= 0.7
+                and s.source_url
+                and _classify_source(s.source_url)[0] >= 0.5
+                and s.verification_snippet)
         ]
         for t1_sup in expansion_roots:
             queries2 = generate_discovery_queries(
@@ -1678,6 +2138,35 @@ def verify_suppliers_batch(
 # VCG: URL content fetching
 # ---------------------------------------------------------------------------
 
+_PDF_OBJECT_MARKERS: frozenset[str] = frozenset({
+    "xref", "endobj", "stream", "endstream", "flatedecode",
+    "startxref", "%%eof", "obj\n", "/type", "/page",
+})
+
+
+def _is_readable_text(text: str, min_words: int = 20, min_alpha_ratio: float = 0.5) -> bool:
+    """Return True if text looks like human-readable prose.
+
+    Rejects: empty/blank strings, raw PDF magic bytes, sparse pypdf output
+    (<20 words), raw PDF structure tokens (xref/endobj/stream markers —
+    high printable ratio but not prose), and strings where fewer than half
+    the characters are alphabetic (binary residue).
+    """
+    if not text or not text.strip():
+        return False
+    if text.lstrip().startswith("%PDF"):
+        return False
+    words = text.split()
+    if len(words) < min_words:
+        return False
+    text_lower = text.lower()
+    if any(marker in text_lower for marker in _PDF_OBJECT_MARKERS):
+        return False
+    alpha = sum(1 for c in text if c.isalpha())
+    if alpha / len(text) < min_alpha_ratio:
+        return False
+    return True
+
 
 def fetch_url_content(url: str) -> tuple[str, str, str, str, int]:
     """Download URL and return (plain_text, sha256_hex, mime_type, final_url, http_status).
@@ -1734,6 +2223,8 @@ def fetch_url_content(url: str) -> tuple[str, str, str, str, int]:
 
     try:
         if mime_type == "application/pdf":
+            plain_text = ""
+            # Attempt 1: pypdf
             try:
                 import io
                 from pypdf import PdfReader
@@ -1742,9 +2233,23 @@ def fetch_url_content(url: str) -> tuple[str, str, str, str, int]:
                     page.extract_text() or "" for page in reader.pages[:20]
                 )[:50_000]
             except Exception:
-                # Fallback: strip non-printable chars from raw UTF-8 decode.
-                raw_decoded = raw_bytes.decode("utf-8", errors="replace")
-                plain_text = re.sub(r"[^\x09\x0a\x0d\x20-\x7e]", " ", raw_decoded)[:50_000]
+                pass
+
+            # Attempt 2: pdfplumber (handles columns/tables better than pypdf)
+            if not _is_readable_text(plain_text):
+                try:
+                    import io as _io
+                    import pdfplumber
+                    with pdfplumber.open(_io.BytesIO(raw_bytes)) as pdf:
+                        plain_text = "\n".join(
+                            (page.extract_text() or "") for page in pdf.pages[:20]
+                        )[:50_000]
+                except Exception:
+                    pass
+
+            # If both fail the quality check: return empty (no garbage fallback)
+            if not _is_readable_text(plain_text):
+                plain_text = ""
             title = ""
         else:
             html_text = raw_bytes.decode("utf-8", errors="replace")

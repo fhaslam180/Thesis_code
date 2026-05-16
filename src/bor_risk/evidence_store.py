@@ -16,12 +16,6 @@ from bor_risk.models import EvidencePacket
 
 _DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
-_OFFICIAL_TLDS = {".gov", ".edu", ".org"}
-_OFFICIAL_DOMAIN_KEYWORDS = {
-    "reuters", "bloomberg", "wsj", "ft.com", "sec.gov",
-    "ir.", "investor.", "corporate.", "annual-report",
-}
-
 
 def _extract_domain(url: str) -> str:
     """Extract netloc from URL, returning empty string on failure."""
@@ -31,14 +25,88 @@ def _extract_domain(url: str) -> str:
         return ""
 
 
-def _is_official_domain(domain: str) -> bool:
-    """Heuristic: is this an official or high-quality source domain?"""
-    dl = domain.lower()
-    if any(dl.endswith(tld) for tld in _OFFICIAL_TLDS):
-        return True
-    if any(kw in dl for kw in _OFFICIAL_DOMAIN_KEYWORDS):
-        return True
-    return False
+# ---------------------------------------------------------------------------
+# Source quality classifier
+# ---------------------------------------------------------------------------
+
+_FORUM_DOMAINS: frozenset[str] = frozenset({
+    "reddit.com", "quora.com", "stackexchange.com", "tripadvisor.com", "yelp.com",
+})
+_FORUM_SUBDOMAIN_PREFIXES: tuple[str, ...] = (
+    "discussions.", "forums.", "community.", "talk.", "answers.",
+)
+
+_DOMAIN_TIERS: list[tuple[frozenset[str], float, str]] = [
+    (frozenset({"sec.gov", "edgar.sec.gov", "companies-house.gov.uk"}),
+     1.0, "regulatory_filing"),
+    (frozenset({"apple.com", "toyota.com", "nike.com"}),
+     0.85, "official_company"),
+    (frozenset({"bloomberg.com", "reuters.com", "wsj.com", "ft.com",
+                "nikkei.com", "economist.com", "businessinsider.com"}),
+     0.8, "news"),
+    (frozenset({"supplychainbrain.com", "supplychaindigital.com", "industryweek.com",
+                "globalsources.com", "purchasing.com", "thomasnet.com"}),
+     0.6, "industry_database"),
+    (frozenset({"wikipedia.org", "businesswire.com", "prnewswire.com",
+                "globenewswire.com", "cnbc.com", "marketwatch.com"}),
+     0.5, "general"),
+]
+
+_PATH_TIERS: list[tuple[frozenset[str], float, str]] = [
+    (frozenset({"supplier-responsibility", "supplier-list", "supplier_list",
+                "supply-chain-report", "responsibility"}),
+     0.7, "official_report_candidate"),
+    (frozenset({"newsroom", "press-release", "pressroom"}),
+     0.7, "official_company"),
+    (frozenset({"annual-report", "annual_report", "10-k", "10k",
+                "sustainability-report", "esg-report", "investor-relations", "/ir/"}),
+     0.7, "official_report_candidate"),
+]
+
+
+def _domain_matches(domain: str, base: str) -> bool:
+    """True if domain is exactly base or a subdomain (e.g. www.base.com)."""
+    return domain == base or domain.endswith("." + base)
+
+
+def _classify_source(url: str) -> tuple[float, str]:
+    """Return (quality, source_type) from parsed domain and path.
+
+    Precedence (highest to lowest):
+    1. Forum domains/subdomains  → 0.2, "forum"  (cannot be upgraded by path rules)
+    2. Government TLD (.gov)     → 1.0, "regulatory_filing"
+    3. Named domain tiers        → 0.5–1.0
+    4. Official-report path      → 0.7, "official_report_candidate"  (unknown domain)
+    5. Default                   → 0.4, "unknown"
+    """
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        path = parsed.path.lower()
+    except Exception:
+        return 0.4, "unknown"
+
+    # 1. Forum domains/subdomains always win
+    if any(_domain_matches(domain, d) for d in _FORUM_DOMAINS):
+        return 0.2, "forum"
+    if any(domain.startswith(prefix) for prefix in _FORUM_SUBDOMAIN_PREFIXES):
+        return 0.2, "forum"
+
+    # 2. Government TLD catch-all
+    if domain.endswith(".gov") or domain.endswith(".gov.uk"):
+        return 1.0, "regulatory_filing"
+
+    # 3. Named domain rules (exact/subdomain match)
+    for bases, quality, stype in _DOMAIN_TIERS:
+        if any(_domain_matches(domain, b) for b in bases):
+            return quality, stype
+
+    # 4. Path rules — only reached for non-forum, non-gov, unrecognised domains
+    for keywords, quality, stype in _PATH_TIERS:
+        if any(kw in path for kw in keywords):
+            return quality, stype
+
+    return 0.4, "unknown"
 
 
 class EvidenceStore:
@@ -68,6 +136,7 @@ class EvidenceStore:
         """
         evidence_id = content_hash[:16]
         domain = _extract_domain(final_url or url)
+        quality, stype = _classify_source(final_url or url)
 
         snapshot_path: str | None = None
         if content:
@@ -89,8 +158,10 @@ class EvidenceStore:
             content_hash=content_hash,
             mime_type=mime_type,
             snapshot_path=snapshot_path,
+            source_quality=quality,
+            source_type=stype,
             quality_signals={
-                "is_official_domain": _is_official_domain(domain),
+                "is_official_domain": quality >= 0.8,
                 "is_pdf": mime_type == "application/pdf",
                 "word_count": len(content.split()) if content else 0,
             },
@@ -162,6 +233,8 @@ class EvidenceStore:
             "content_hash": packet.content_hash,
             "domain": packet.domain,
             "retrieved_at": packet.retrieved_at,
+            "source_quality": packet.source_quality,
+            "source_type": packet.source_type,
         }
         self._url_index_path.parent.mkdir(parents=True, exist_ok=True)
         self._url_index_path.write_text(
